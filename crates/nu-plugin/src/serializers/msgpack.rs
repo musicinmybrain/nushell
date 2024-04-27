@@ -26,7 +26,7 @@ impl Encoder<PluginInput> for MsgPackSerializer {
         plugin_input: &PluginInput,
         writer: &mut impl std::io::Write,
     ) -> Result<(), nu_protocol::ShellError> {
-        rmp_serde::encode::write(writer, plugin_input).map_err(rmp_encode_err)
+        rmp_serde::encode::write_named(writer, plugin_input).map_err(rmp_encode_err)
     }
 
     fn decode(
@@ -46,7 +46,7 @@ impl Encoder<PluginOutput> for MsgPackSerializer {
         plugin_output: &PluginOutput,
         writer: &mut impl std::io::Write,
     ) -> Result<(), ShellError> {
-        rmp_serde::encode::write(writer, plugin_output).map_err(rmp_encode_err)
+        rmp_serde::encode::write_named(writer, plugin_output).map_err(rmp_encode_err)
     }
 
     fn decode(
@@ -82,17 +82,16 @@ fn rmp_encode_err(err: rmp_serde::encode::Error) -> ShellError {
 fn rmp_decode_err<T>(err: rmp_serde::decode::Error) -> Result<Option<T>, ShellError> {
     match err {
         rmp_serde::decode::Error::InvalidMarkerRead(err)
-            if matches!(err.kind(), ErrorKind::UnexpectedEof) =>
-        {
-            // EOF
-            Ok(None)
-        }
-        rmp_serde::decode::Error::InvalidMarkerRead(_)
-        | rmp_serde::decode::Error::InvalidDataRead(_) => {
-            // I/O error
-            Err(ShellError::IOError {
-                msg: err.to_string(),
-            })
+        | rmp_serde::decode::Error::InvalidDataRead(err) => {
+            if matches!(err.kind(), ErrorKind::UnexpectedEof) {
+                // EOF
+                Ok(None)
+            } else {
+                // I/O error
+                Err(ShellError::IOError {
+                    msg: err.to_string(),
+                })
+            }
         }
         _ => {
             // Something else

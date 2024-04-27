@@ -1,10 +1,5 @@
-use nu_protocol::engine::{EngineState, Stack};
-use nu_protocol::{
-    ast::{Argument, Call, Expr, Expression},
-    engine::Command,
-    ShellError, Signature,
-};
-use nu_protocol::{PipelineData, Spanned, Type};
+use nu_engine::command_prelude::*;
+use nu_protocol::ast::{Argument, Expr, Expression};
 
 #[derive(Clone)]
 pub struct KnownExternal {
@@ -42,7 +37,6 @@ impl Command for KnownExternal {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let call_span = call.span();
         let head_span = call.head;
         let decl_id = engine_state
             .find_decl("run-external".as_bytes(), &[])
@@ -108,28 +102,6 @@ impl Command for KnownExternal {
                 Argument::Unknown(unknown) => extern_call.add_unknown(unknown.clone()),
                 Argument::Spread(args) => extern_call.add_spread(args.clone()),
             }
-        }
-
-        if call.redirect_stdout {
-            extern_call.add_named((
-                Spanned {
-                    item: "redirect-stdout".into(),
-                    span: call_span,
-                },
-                None,
-                None,
-            ))
-        }
-
-        if call.redirect_stderr {
-            extern_call.add_named((
-                Spanned {
-                    item: "redirect-stderr".into(),
-                    span: call_span,
-                },
-                None,
-                None,
-            ))
         }
 
         command.run(engine_state, stack, &extern_call, input)

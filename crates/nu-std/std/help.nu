@@ -647,6 +647,7 @@ def build-command-page [command: record] {
             (if not ($example.result | is-empty) {
                 $example.result
                 | table
+                | to text
                 | if ($example.result | describe) == "binary" { str join } else { lines }
                 | each {|line|
                     $"  ($line)"
@@ -714,7 +715,7 @@ def pretty-cmd [] {
 #   > help match
 #
 #   show help for single sub-command, alias, or module
-#   > help str lpad
+#   > help str join
 #
 #   search for string in command names, usage and search terms
 #   > help --find char

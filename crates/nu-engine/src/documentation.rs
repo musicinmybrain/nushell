@@ -1,13 +1,12 @@
-use nu_protocol::ast::{Argument, Expr, Expression, RecordItem};
+use crate::eval_call;
 use nu_protocol::{
-    ast::Call,
+    ast::{Argument, Call, Expr, Expression, RecordItem},
+    debugger::WithoutDebug,
     engine::{EngineState, Stack},
     record, Category, Example, IntoPipelineData, PipelineData, Signature, Span, SyntaxShape, Type,
     Value,
 };
 use std::{collections::HashMap, fmt::Write};
-
-use crate::eval_call;
 
 pub fn get_full_help(
     sig: &Signature,
@@ -22,6 +21,9 @@ pub fn get_full_help(
         no_color: !config.use_ansi_coloring,
         brief: false,
     };
+
+    let stack = &mut stack.start_capture();
+
     get_documentation(
         sig,
         examples,
@@ -234,16 +236,14 @@ fn get_documentation(
                 ));
             }
 
-            let mut caller_stack = Stack::new();
-            if let Ok(result) = eval_call(
+            let caller_stack = &mut Stack::new().capture();
+            if let Ok(result) = eval_call::<WithoutDebug>(
                 engine_state,
-                &mut caller_stack,
+                caller_stack,
                 &Call {
                     decl_id,
                     head: span,
                     arguments: vec![],
-                    redirect_stdout: true,
-                    redirect_stderr: true,
                     parser_info: HashMap::new(),
                 },
                 PipelineData::Value(Value::list(vals, span), None),
@@ -339,7 +339,7 @@ fn get_ansi_color_for_component_or_default(
     default: &str,
 ) -> String {
     if let Some(color) = &engine_state.get_config().color_config.get(theme_component) {
-        let mut caller_stack = Stack::new();
+        let caller_stack = &mut Stack::new().capture();
         let span = Span::unknown();
 
         let argument_opt = get_argument_for_color_value(engine_state, color, span);
@@ -347,15 +347,13 @@ fn get_ansi_color_for_component_or_default(
         // Call ansi command using argument
         if let Some(argument) = argument_opt {
             if let Some(decl_id) = engine_state.find_decl(b"ansi", &[]) {
-                if let Ok(result) = eval_call(
+                if let Ok(result) = eval_call::<WithoutDebug>(
                     engine_state,
-                    &mut caller_stack,
+                    caller_stack,
                     &Call {
                         decl_id,
                         head: span,
                         arguments: vec![argument],
-                        redirect_stdout: true,
-                        redirect_stderr: true,
                         parser_info: HashMap::new(),
                     },
                     PipelineData::Empty,
@@ -378,8 +376,8 @@ fn get_argument_for_color_value(
 ) -> Option<Argument> {
     match color {
         Value::Record { val, .. } => {
-            let record_exp: Vec<RecordItem> = val
-                .into_iter()
+            let record_exp: Vec<RecordItem> = (**val)
+                .iter()
                 .map(|(k, v)| {
                     RecordItem::Pair(
                         Expression {
@@ -402,10 +400,13 @@ fn get_argument_for_color_value(
 
             Some(Argument::Positional(Expression {
                 span: Span::unknown(),
-                ty: Type::Record(vec![
-                    ("fg".to_string(), Type::String),
-                    ("attr".to_string(), Type::String),
-                ]),
+                ty: Type::Record(
+                    [
+                        ("fg".to_string(), Type::String),
+                        ("attr".to_string(), Type::String),
+                    ]
+                    .into(),
+                ),
                 expr: Expr::Record(record_exp),
                 custom_completion: None,
             }))

@@ -1,14 +1,15 @@
-use std::path::PathBuf;
-
 use nu_engine::eval_block;
 use nu_parser::parse;
 use nu_protocol::{
+    debugger::WithoutDebug,
     engine::{EngineState, Stack, StateWorkingSet},
     eval_const::create_nu_constant,
     PipelineData, ShellError, Span, Value, NU_VARIABLE_ID,
 };
 use nu_test_support::fs;
 use reedline::Suggestion;
+use std::path::PathBuf;
+
 const SEP: char = std::path::MAIN_SEPARATOR;
 
 fn create_default_context() -> EngineState {
@@ -194,13 +195,11 @@ pub fn merge_input(
 
     engine_state.merge_delta(delta)?;
 
-    assert!(eval_block(
+    assert!(eval_block::<WithoutDebug>(
         engine_state,
         stack,
         &block,
-        PipelineData::Value(Value::nothing(Span::unknown(),), None),
-        false,
-        false
+        PipelineData::Value(Value::nothing(Span::unknown()), None),
     )
     .is_ok());
 

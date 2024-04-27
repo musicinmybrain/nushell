@@ -63,21 +63,17 @@ fn let_pipeline_redirects_externals() {
 #[test]
 fn let_err_pipeline_redirects_externals() {
     let actual = nu!(
-        r#"let x = with-env [FOO "foo"] {nu --testbin echo_env_stderr FOO e>| str length}; $x"#
+        r#"let x = with-env { FOO: "foo" } {nu --testbin echo_env_stderr FOO e>| str length}; $x"#
     );
-
-    // have an extra \n, so length is 4.
-    assert_eq!(actual.out, "4");
+    assert_eq!(actual.out, "3");
 }
 
 #[test]
 fn let_outerr_pipeline_redirects_externals() {
     let actual = nu!(
-        r#"let x = with-env [FOO "foo"] {nu --testbin echo_env_stderr FOO o+e>| str length}; $x"#
+        r#"let x = with-env { FOO: "foo" } {nu --testbin echo_env_stderr FOO o+e>| str length}; $x"#
     );
-
-    // have an extra \n, so length is 4.
-    assert_eq!(actual.out, "4");
+    assert_eq!(actual.out, "3");
 }
 
 #[ignore]
@@ -88,4 +84,10 @@ fn let_with_external_failed() {
     let actual = nu!(r#"let x = nu --testbin outcome_err "aa"; echo fail"#);
 
     assert!(!actual.out.contains("fail"));
+}
+
+#[test]
+fn let_glob_type() {
+    let actual = nu!("let x: glob = 'aa'; $x | describe");
+    assert_eq!(actual.out, "glob");
 }

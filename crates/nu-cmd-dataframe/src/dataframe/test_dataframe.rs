@@ -1,15 +1,12 @@
-use nu_engine::eval_block;
-use nu_parser::parse;
-use nu_protocol::{
-    engine::{Command, EngineState, Stack, StateWorkingSet},
-    Example, PipelineData, Span,
+use super::{
+    eager::{SchemaDF, ToDataFrame},
+    expressions::ExprCol,
+    lazy::{LazyCollect, LazyFillNull, ToLazyFrame},
 };
-
-use super::eager::{SchemaDF, ToDataFrame};
-use super::expressions::ExprCol;
-use super::lazy::LazyFillNull;
-use super::lazy::{LazyCollect, ToLazyFrame};
 use nu_cmd_lang::Let;
+use nu_engine::{command_prelude::*, eval_block};
+use nu_parser::parse;
+use nu_protocol::{debugger::WithoutDebug, engine::StateWorkingSet};
 
 pub fn test_dataframe(cmds: Vec<Box<dyn Command + 'static>>) {
     if cmds.is_empty() {
@@ -78,18 +75,12 @@ pub fn test_dataframe_example(engine_state: &mut Box<EngineState>, example: &Exa
         .merge_delta(delta)
         .expect("Error merging delta");
 
-    let mut stack = Stack::new();
+    let mut stack = Stack::new().capture();
 
-    let result = eval_block(
-        engine_state,
-        &mut stack,
-        &block,
-        PipelineData::empty(),
-        true,
-        true,
-    )
-    .unwrap_or_else(|err| panic!("test eval error in `{}`: {:?}", example.example, err))
-    .into_value(Span::test_data());
+    let result =
+        eval_block::<WithoutDebug>(engine_state, &mut stack, &block, PipelineData::empty())
+            .unwrap_or_else(|err| panic!("test eval error in `{}`: {:?}", example.example, err))
+            .into_value(Span::test_data());
 
     println!("input: {}", example.example);
     println!("result: {result:?}");

@@ -1,10 +1,5 @@
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::Call,
-    engine::{Closure, Command, EngineState, Stack, StateWorkingSet},
-    record, Category, Example, IntoPipelineData, PipelineData, PipelineMetadata, Record,
-    ShellError, Signature, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::{engine::StateWorkingSet, PipelineMetadata};
 
 #[derive(Clone)]
 pub struct Describe;
@@ -51,6 +46,19 @@ impl Command for Describe {
             detailed: call.has_flag(engine_state, stack, "detailed")?,
             collect_lazyrecords: call.has_flag(engine_state, stack, "collect-lazyrecords")?,
         };
+        if options.collect_lazyrecords {
+            nu_protocol::report_error_new(
+                engine_state,
+                &ShellError::GenericError {
+                    error: "Deprecated flag".into(),
+                    msg: "the `--collect-lazyrecords` flag is deprecated, since lazy records will be removed in 0.94.0"
+                        .into(),
+                    span: Some(call.head),
+                    help: None,
+                    inner: vec![],
+                },
+            );
+        }
         run(Some(engine_state), call, input, options)
     }
 
@@ -235,7 +243,7 @@ fn run(
                            if options.no_collect {
                             Value::string("any", head)
                            } else {
-                            describe_value(input.into_value(head), head, engine_state, call, options)?
+                            describe_value(input.into_value(head), head, engine_state, options)?
                            }
                         },
                         "metadata" => metadata_to_value(metadata, head),
@@ -246,10 +254,7 @@ fn run(
                 Value::string("stream", head)
             } else {
                 let value = input.into_value(head);
-                let base_description = match value {
-                    Value::CustomValue { val, .. } => val.value_string(),
-                    _ => value.get_type().to_string(),
-                };
+                let base_description = value.get_type().to_string();
 
                 Value::string(format!("{} (stream)", base_description), head)
             }
@@ -257,12 +262,9 @@ fn run(
         _ => {
             let value = input.into_value(head);
             if !options.detailed {
-                match value {
-                    Value::CustomValue { val, .. } => Value::string(val.value_string(), head),
-                    _ => Value::string(value.get_type().to_string(), head),
-                }
+                Value::string(value.get_type().to_string(), head)
             } else {
-                describe_value(value, head, engine_state, call, options)?
+                describe_value(value, head, engine_state, options)?
             }
         }
     };
@@ -275,7 +277,7 @@ fn compact_primitive_description(mut value: Value) -> Value {
         if val.len() != 1 {
             return value;
         }
-        if let Some(type_name) = val.get_mut("type") {
+        if let Some(type_name) = val.to_mut().get_mut("type") {
             return std::mem::take(type_name);
         }
     }
@@ -286,14 +288,13 @@ fn describe_value(
     value: Value,
     head: nu_protocol::Span,
     engine_state: Option<&EngineState>,
-    call: &Call,
     options: Options,
 ) -> Result<Value, ShellError> {
     Ok(match value {
-        Value::CustomValue { val, internal_span } => Value::record(
+        Value::Custom { val, .. } => Value::record(
             record!(
                 "type" => Value::string("custom", head),
-                "subtype" => run(engine_state,call, val.to_base_value(internal_span)?.into_pipeline_data(), options)?.into_value(head),
+                "subtype" => Value::string(val.type_name(), head),
             ),
             head,
         ),
@@ -312,13 +313,13 @@ fn describe_value(
             ),
             head,
         ),
-        Value::Record { mut val, .. } => {
+        Value::Record { val, .. } => {
+            let mut val = val.into_owned();
             for (_k, v) in val.iter_mut() {
                 *v = compact_primitive_description(describe_value(
                     std::mem::take(v),
                     head,
                     engine_state,
-                    call,
                     options,
                 )?);
             }
@@ -338,23 +339,19 @@ fn describe_value(
                 "length" => Value::int(vals.len() as i64, head),
                 "values" => Value::list(vals.into_iter().map(|v|
                     Ok(compact_primitive_description(
-                        describe_value(v, head, engine_state, call, options)?
+                        describe_value(v, head, engine_state, options)?
                     ))
                 )
                 .collect::<Result<Vec<Value>, ShellError>>()?, head),
             ),
             head,
         ),
-        Value::Block { val, .. }
-        | Value::Closure {
-            val: Closure { block_id: val, .. },
-            ..
-        } => {
-            let block = engine_state.map(|engine_state| engine_state.get_block(val));
+        Value::Closure { val, .. } => {
+            let block = engine_state.map(|engine_state| engine_state.get_block(val.block_id));
 
             if let Some(block) = block {
                 let mut record = Record::new();
-                record.push("type", Value::string(value.get_type().to_string(), head));
+                record.push("type", Value::string("closure", head));
                 record.push(
                     "signature",
                     Value::record(
@@ -405,20 +402,21 @@ fn describe_value(
 
             if options.collect_lazyrecords {
                 let collected = val.collect()?;
-                if let Value::Record { mut val, .. } =
-                    describe_value(collected, head, engine_state, call, options)?
+                if let Value::Record { val, .. } =
+                    describe_value(collected, head, engine_state, options)?
                 {
-                    record.push("length", Value::int(val.len() as i64, head));
+                    let mut val = Record::clone(&val);
+
                     for (_k, v) in val.iter_mut() {
                         *v = compact_primitive_description(describe_value(
                             std::mem::take(v),
                             head,
                             engine_state,
-                            call,
                             options,
                         )?);
                     }
 
+                    record.push("length", Value::int(val.len() as i64, head));
                     record.push("columns", Value::record(val, head));
                 } else {
                     let cols = val.column_names();

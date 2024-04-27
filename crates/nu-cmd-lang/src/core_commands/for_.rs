@@ -1,10 +1,5 @@
-use nu_engine::{eval_block, eval_expression, CallExt};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Block, Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, ListStream, PipelineData, ShellError, Signature, SyntaxShape, Type,
-    Value,
-};
+use nu_engine::{command_prelude::*, get_eval_block, get_eval_expression};
+use nu_protocol::ListStream;
 
 #[derive(Clone)]
 pub struct For;
@@ -70,19 +65,28 @@ impl Command for For {
             .expect("checked through parser")
             .as_keyword()
             .expect("internal error: missing keyword");
-        let values = eval_expression(engine_state, stack, keyword_expr)?;
 
-        let block: Block = call.req(engine_state, stack, 2)?;
+        let block_id = call
+            .positional_nth(2)
+            .expect("checked through parser")
+            .as_block()
+            .expect("internal error: missing block");
+
+        let eval_expression = get_eval_expression(engine_state);
+        let eval_block = get_eval_block(engine_state);
+
+        let value = eval_expression(engine_state, stack, keyword_expr)?;
 
         let numbered = call.has_flag(engine_state, stack, "numbered")?;
 
         let ctrlc = engine_state.ctrlc.clone();
         let engine_state = engine_state.clone();
-        let block = engine_state.get_block(block.block_id).clone();
-        let redirect_stdout = call.redirect_stdout;
-        let redirect_stderr = call.redirect_stderr;
+        let block = engine_state.get_block(block_id);
 
-        match values {
+        let stack = &mut stack.push_redirection(None, None);
+
+        let span = value.span();
+        match value {
             Value::List { vals, .. } => {
                 for (idx, x) in ListStream::from_stream(vals.into_iter(), ctrlc).enumerate() {
                     // with_env() is used here to ensure that each iteration uses
@@ -104,15 +108,7 @@ impl Command for For {
                         },
                     );
 
-                    //let block = engine_state.get_block(block_id);
-                    match eval_block(
-                        &engine_state,
-                        stack,
-                        &block,
-                        PipelineData::empty(),
-                        redirect_stdout,
-                        redirect_stderr,
-                    ) {
+                    match eval_block(&engine_state, stack, block, PipelineData::empty()) {
                         Err(ShellError::Break { .. }) => {
                             break;
                         }
@@ -134,7 +130,7 @@ impl Command for For {
                 }
             }
             Value::Range { val, .. } => {
-                for (idx, x) in val.into_range_iter(ctrlc)?.enumerate() {
+                for (idx, x) in val.into_range_iter(span, ctrlc).enumerate() {
                     stack.add_var(
                         var_id,
                         if numbered {
@@ -150,15 +146,7 @@ impl Command for For {
                         },
                     );
 
-                    //let block = engine_state.get_block(block_id);
-                    match eval_block(
-                        &engine_state,
-                        stack,
-                        &block,
-                        PipelineData::empty(),
-                        redirect_stdout,
-                        redirect_stderr,
-                    ) {
+                    match eval_block(&engine_state, stack, block, PipelineData::empty()) {
                         Err(ShellError::Break { .. }) => {
                             break;
                         }
@@ -182,15 +170,7 @@ impl Command for For {
             x => {
                 stack.add_var(var_id, x);
 
-                eval_block(
-                    &engine_state,
-                    stack,
-                    &block,
-                    PipelineData::empty(),
-                    redirect_stdout,
-                    redirect_stderr,
-                )?
-                .into_value(head);
+                eval_block(&engine_state, stack, block, PipelineData::empty())?.into_value(head);
             }
         }
         Ok(PipelineData::empty())

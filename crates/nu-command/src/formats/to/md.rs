@@ -1,12 +1,7 @@
-use indexmap::map::IndexMap;
+use indexmap::IndexMap;
 use nu_cmd_base::formats::to::delimited::merge_descriptors;
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    Category, Config, Example, IntoPipelineData, PipelineData, ShellError, Signature, Span, Type,
-    Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::Config;
 
 #[derive(Clone)]
 pub struct ToMd;
@@ -151,7 +146,21 @@ fn collect_headers(headers: &[String]) -> (Vec<String>, Vec<usize>) {
 
 fn table(input: PipelineData, pretty: bool, config: &Config) -> String {
     let vec_of_values = input.into_iter().collect::<Vec<Value>>();
-    let headers = merge_descriptors(&vec_of_values);
+    let mut headers = merge_descriptors(&vec_of_values);
+
+    let mut empty_header_index = 0;
+    for value in &vec_of_values {
+        if let Value::Record { val, .. } = value {
+            for column in val.columns() {
+                if column.is_empty() && !headers.contains(&String::new()) {
+                    headers.insert(empty_header_index, String::new());
+                    empty_header_index += 1;
+                    break;
+                }
+                empty_header_index += 1;
+            }
+        }
+    }
 
     let (escaped_headers, mut column_widths) = collect_headers(&headers);
 
@@ -413,6 +422,34 @@ mod tests {
             | Ecuador     |
             | New Zealand |
             | USA         |
+        "#)
+        );
+    }
+
+    #[test]
+    fn test_empty_column_header() {
+        let value = Value::test_list(vec![
+            Value::test_record(record! {
+                "" => Value::test_string("1"),
+                "foo" => Value::test_string("2"),
+            }),
+            Value::test_record(record! {
+                "" => Value::test_string("3"),
+                "foo" => Value::test_string("4"),
+            }),
+        ]);
+
+        assert_eq!(
+            table(
+                value.clone().into_pipeline_data(),
+                false,
+                &Config::default()
+            ),
+            one(r#"
+            ||foo|
+            |-|-|
+            |1|2|
+            |3|4|
         "#)
         );
     }

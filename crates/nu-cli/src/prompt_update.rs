@@ -1,10 +1,9 @@
 use crate::NushellPrompt;
 use log::trace;
-use nu_engine::eval_subexpression;
-use nu_protocol::report_error;
+use nu_engine::ClosureEvalOnce;
 use nu_protocol::{
     engine::{EngineState, Stack, StateWorkingSet},
-    Config, PipelineData, Value,
+    report_error, Config, PipelineData, Value,
 };
 use reedline::Prompt;
 
@@ -39,11 +38,9 @@ fn get_prompt_string(
         .get_env_var(engine_state, prompt)
         .and_then(|v| match v {
             Value::Closure { val, .. } => {
-                let block = engine_state.get_block(val.block_id);
-                let mut stack = stack.captures_to_stack(val.captures);
-                // Use eval_subexpression to force a redirection of output, so we can use everything in prompt
-                let ret_val =
-                    eval_subexpression(engine_state, &mut stack, block, PipelineData::empty());
+                let result = ClosureEvalOnce::new(engine_state, stack, val)
+                    .run_with_input(PipelineData::Empty);
+
                 trace!(
                     "get_prompt_string (block) {}:{}:{}",
                     file!(),
@@ -51,25 +48,7 @@ fn get_prompt_string(
                     column!()
                 );
 
-                ret_val
-                    .map_err(|err| {
-                        let working_set = StateWorkingSet::new(engine_state);
-                        report_error(&working_set, &err);
-                    })
-                    .ok()
-            }
-            Value::Block { val: block_id, .. } => {
-                let block = engine_state.get_block(block_id);
-                // Use eval_subexpression to force a redirection of output, so we can use everything in prompt
-                let ret_val = eval_subexpression(engine_state, stack, block, PipelineData::empty());
-                trace!(
-                    "get_prompt_string (block) {}:{}:{}",
-                    file!(),
-                    line!(),
-                    column!()
-                );
-
-                ret_val
+                result
                     .map_err(|err| {
                         let working_set = StateWorkingSet::new(engine_state);
                         report_error(&working_set, &err);
@@ -99,12 +78,10 @@ fn get_prompt_string(
 pub(crate) fn update_prompt(
     config: &Config,
     engine_state: &EngineState,
-    stack: &Stack,
+    stack: &mut Stack,
     nu_prompt: &mut NushellPrompt,
 ) {
-    let mut stack = stack.clone();
-
-    let left_prompt_string = get_prompt_string(PROMPT_COMMAND, config, engine_state, &mut stack);
+    let left_prompt_string = get_prompt_string(PROMPT_COMMAND, config, engine_state, stack);
 
     // Now that we have the prompt string lets ansify it.
     // <133 A><prompt><133 B><command><133 C><command output>
@@ -120,20 +97,18 @@ pub(crate) fn update_prompt(
         left_prompt_string
     };
 
-    let right_prompt_string =
-        get_prompt_string(PROMPT_COMMAND_RIGHT, config, engine_state, &mut stack);
+    let right_prompt_string = get_prompt_string(PROMPT_COMMAND_RIGHT, config, engine_state, stack);
 
-    let prompt_indicator_string =
-        get_prompt_string(PROMPT_INDICATOR, config, engine_state, &mut stack);
+    let prompt_indicator_string = get_prompt_string(PROMPT_INDICATOR, config, engine_state, stack);
 
     let prompt_multiline_string =
-        get_prompt_string(PROMPT_MULTILINE_INDICATOR, config, engine_state, &mut stack);
+        get_prompt_string(PROMPT_MULTILINE_INDICATOR, config, engine_state, stack);
 
     let prompt_vi_insert_string =
-        get_prompt_string(PROMPT_INDICATOR_VI_INSERT, config, engine_state, &mut stack);
+        get_prompt_string(PROMPT_INDICATOR_VI_INSERT, config, engine_state, stack);
 
     let prompt_vi_normal_string =
-        get_prompt_string(PROMPT_INDICATOR_VI_NORMAL, config, engine_state, &mut stack);
+        get_prompt_string(PROMPT_INDICATOR_VI_NORMAL, config, engine_state, stack);
 
     // apply the other indicators
     nu_prompt.update_all_prompt_strings(

@@ -1,9 +1,4 @@
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, IntoInterruptiblePipelineData, PipelineData, ShellError, Signature,
-    Type, Value,
-};
+use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
 pub struct Reverse;
@@ -66,7 +61,6 @@ impl Command for Reverse {
     ) -> Result<PipelineData, ShellError> {
         let metadata = input.metadata();
 
-        #[allow(clippy::needless_collect)]
         let v: Vec<_> = input.into_iter_strict(call.head)?.collect();
         let iter = v.into_iter().rev();
         Ok(iter.into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))

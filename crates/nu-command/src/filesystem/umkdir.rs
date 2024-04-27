@@ -1,22 +1,30 @@
-use nu_engine::env::current_dir;
-use nu_engine::CallExt;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Category, Example, PipelineData, ShellError, Signature, SyntaxShape, Type};
+use nu_engine::{command_prelude::*, current_dir};
 
 use uu_mkdir::mkdir;
+#[cfg(not(windows))]
+use uucore::mode;
+
+use super::util::get_rest_for_glob_pattern;
 
 #[derive(Clone)]
 pub struct UMkdir;
 
 const IS_RECURSIVE: bool = true;
-// This is the same default as Rust's std uses:
-// https://doc.rust-lang.org/nightly/std/os/unix/fs/trait.DirBuilderExt.html#tymethod.mode
 const DEFAULT_MODE: u32 = 0o777;
+
+#[cfg(not(windows))]
+fn get_mode() -> u32 {
+    !mode::get_umask() & DEFAULT_MODE
+}
+
+#[cfg(windows)]
+fn get_mode() -> u32 {
+    DEFAULT_MODE
+}
 
 impl Command for UMkdir {
     fn name(&self) -> &str {
-        "umkdir"
+        "mkdir"
     }
 
     fn usage(&self) -> &str {
@@ -28,11 +36,11 @@ impl Command for UMkdir {
     }
 
     fn signature(&self) -> Signature {
-        Signature::build("umkdir")
+        Signature::build("mkdir")
             .input_output_types(vec![(Type::Nothing, Type::Nothing)])
             .rest(
                 "rest",
-                SyntaxShape::Directory,
+                SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::Directory]),
                 "The name(s) of the path(s) to create.",
             )
             .switch(
@@ -51,10 +59,9 @@ impl Command for UMkdir {
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let cwd = current_dir(engine_state, stack)?;
-        let mut directories = call
-            .rest::<String>(engine_state, stack, 0)?
+        let mut directories = get_rest_for_glob_pattern(engine_state, stack, call, 0)?
             .into_iter()
-            .map(|dir| nu_path::expand_path_with(dir, &cwd))
+            .map(|dir| nu_path::expand_path_with(dir.item.as_ref(), &cwd, dir.item.is_expand()))
             .peekable();
 
         let is_verbose = call.has_flag(engine_state, stack, "verbose")?;
@@ -67,7 +74,7 @@ impl Command for UMkdir {
         }
 
         for dir in directories {
-            if let Err(error) = mkdir(&dir, IS_RECURSIVE, DEFAULT_MODE, is_verbose) {
+            if let Err(error) = mkdir(&dir, IS_RECURSIVE, get_mode(), is_verbose) {
                 return Err(ShellError::GenericError {
                     error: format!("{}", error),
                     msg: format!("{}", error),
@@ -85,12 +92,12 @@ impl Command for UMkdir {
         vec![
             Example {
                 description: "Make a directory named foo",
-                example: "umkdir foo",
+                example: "mkdir foo",
                 result: None,
             },
             Example {
                 description: "Make multiple directories and show the paths created",
-                example: "umkdir -v foo/bar foo2",
+                example: "mkdir -v foo/bar foo2",
                 result: None,
             },
         ]

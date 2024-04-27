@@ -1,10 +1,5 @@
-use nu_engine::{eval_block, CallExt};
-use nu_protocol::ast::{Block, Call, CellPath, PathMember};
-use nu_protocol::engine::{Closure, Command, EngineState, Stack};
-use nu_protocol::{
-    record, Category, Example, FromValue, IntoInterruptiblePipelineData, IntoPipelineData,
-    PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
-};
+use nu_engine::{command_prelude::*, ClosureEval, ClosureEvalOnce};
+use nu_protocol::ast::PathMember;
 
 #[derive(Clone)]
 pub struct Update;
@@ -17,8 +12,8 @@ impl Command for Update {
     fn signature(&self) -> Signature {
         Signature::build("update")
             .input_output_types(vec![
-                (Type::Record(vec![]), Type::Record(vec![])),
-                (Type::Table(vec![]), Type::Table(vec![])),
+                (Type::record(), Type::record()),
+                (Type::table(), Type::table()),
                 (
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::Any)),
@@ -40,6 +35,13 @@ impl Command for Update {
 
     fn usage(&self) -> &str {
         "Update an existing column to have a new value."
+    }
+
+    fn extra_usage(&self) -> &str {
+        "When updating a column, the closure will be run for each row, and the current row will be passed as the first argument. \
+Referencing `$in` inside the closure will provide the value at the column for the current row.
+
+When updating a specific index, the closure will instead be run once. The first argument to the closure and the `$in` value will both be the current value at the index."
     }
 
     fn run(
@@ -73,7 +75,7 @@ impl Command for Update {
                 )),
             },
             Example {
-                description: "You can also use a simple command to update 'authors' to a single string",
+                description: "Implicitly use the `$in` value in a closure to update 'authors'",
                 example: "[[project, authors]; ['nu', ['Andrés', 'JT', 'Yehuda']]] | update authors { str join ',' }",
                 result: Some(Value::test_list(
                     vec![Value::test_record(record! {
@@ -106,35 +108,21 @@ fn update(
     call: &Call,
     input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
-    let span = call.head;
-
+    let head = call.head;
     let cell_path: CellPath = call.req(engine_state, stack, 0)?;
     let replacement: Value = call.req(engine_state, stack, 1)?;
 
-    let redirect_stdout = call.redirect_stdout;
-    let redirect_stderr = call.redirect_stderr;
-
-    let ctrlc = engine_state.ctrlc.clone();
-
     match input {
         PipelineData::Value(mut value, metadata) => {
-            if replacement.coerce_block().is_ok() {
+            if let Value::Closure { val, .. } = replacement {
                 match (cell_path.members.first(), &mut value) {
                     (Some(PathMember::String { .. }), Value::List { vals, .. }) => {
-                        let span = replacement.span();
-                        let capture_block = Closure::from_value(replacement)?;
-                        let block = engine_state.get_block(capture_block.block_id);
-                        let stack = stack.captures_to_stack(capture_block.captures.clone());
+                        let mut closure = ClosureEval::new(engine_state, stack, val);
                         for val in vals {
-                            let mut stack = stack.clone();
                             update_value_by_closure(
                                 val,
-                                span,
-                                engine_state,
-                                &mut stack,
-                                redirect_stdout,
-                                redirect_stderr,
-                                block,
+                                &mut closure,
+                                head,
                                 &cell_path.members,
                                 false,
                             )?;
@@ -143,11 +131,8 @@ fn update(
                     (first, _) => {
                         update_single_value_by_closure(
                             &mut value,
-                            replacement,
-                            engine_state,
-                            stack,
-                            redirect_stdout,
-                            redirect_stderr,
+                            ClosureEvalOnce::new(engine_state, stack, val),
+                            head,
                             &cell_path.members,
                             matches!(first, Some(PathMember::Int { .. })),
                         )?;
@@ -186,14 +171,11 @@ fn update(
                 // cannot fail since loop above does at least one iteration or returns an error
                 let value = pre_elems.last_mut().expect("one element");
 
-                if replacement.coerce_block().is_ok() {
+                if let Value::Closure { val, .. } = replacement {
                     update_single_value_by_closure(
                         value,
-                        replacement,
-                        engine_state,
-                        stack,
-                        redirect_stdout,
-                        redirect_stderr,
+                        ClosureEvalOnce::new(engine_state, stack, val),
+                        head,
                         path,
                         true,
                     )?;
@@ -204,130 +186,95 @@ fn update(
                 Ok(pre_elems
                     .into_iter()
                     .chain(stream)
-                    .into_pipeline_data_with_metadata(metadata, ctrlc))
-            } else if replacement.coerce_block().is_ok() {
-                let replacement_span = replacement.span();
-                let engine_state = engine_state.clone();
-                let capture_block = Closure::from_value(replacement)?;
-                let block = engine_state.get_block(capture_block.block_id).clone();
-                let stack = stack.captures_to_stack(capture_block.captures.clone());
-
+                    .into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
+            } else if let Value::Closure { val, .. } = replacement {
+                let mut closure = ClosureEval::new(engine_state, stack, val);
                 Ok(stream
-                    .map(move |mut input| {
-                        // Recreate the stack for each iteration to
-                        // isolate environment variable changes, etc.
-                        let mut stack = stack.clone();
-
+                    .map(move |mut value| {
                         let err = update_value_by_closure(
-                            &mut input,
-                            replacement_span,
-                            &engine_state,
-                            &mut stack,
-                            redirect_stdout,
-                            redirect_stderr,
-                            &block,
+                            &mut value,
+                            &mut closure,
+                            head,
                             &cell_path.members,
                             false,
                         );
 
                         if let Err(e) = err {
-                            Value::error(e, span)
+                            Value::error(e, head)
                         } else {
-                            input
+                            value
                         }
                     })
-                    .into_pipeline_data_with_metadata(metadata, ctrlc))
+                    .into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
             } else {
                 Ok(stream
-                    .map(move |mut input| {
+                    .map(move |mut value| {
                         if let Err(e) =
-                            input.update_data_at_cell_path(&cell_path.members, replacement.clone())
+                            value.update_data_at_cell_path(&cell_path.members, replacement.clone())
                         {
-                            Value::error(e, span)
+                            Value::error(e, head)
                         } else {
-                            input
+                            value
                         }
                     })
-                    .into_pipeline_data_with_metadata(metadata, ctrlc))
+                    .into_pipeline_data_with_metadata(metadata, engine_state.ctrlc.clone()))
             }
         }
         PipelineData::Empty => Err(ShellError::IncompatiblePathAccess {
             type_name: "empty pipeline".to_string(),
-            span,
+            span: head,
         }),
         PipelineData::ExternalStream { .. } => Err(ShellError::IncompatiblePathAccess {
             type_name: "external stream".to_string(),
-            span,
+            span: head,
         }),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_value_by_closure(
     value: &mut Value,
+    closure: &mut ClosureEval,
     span: Span,
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-    block: &Block,
     cell_path: &[PathMember],
     first_path_member_int: bool,
 ) -> Result<(), ShellError> {
-    let input_at_path = value.clone().follow_cell_path(cell_path, false)?;
+    let value_at_path = value.clone().follow_cell_path(cell_path, false)?;
 
-    if let Some(var) = block.signature.get_positional(0) {
-        if let Some(var_id) = &var.var_id {
-            stack.add_var(
-                *var_id,
-                if first_path_member_int {
-                    input_at_path.clone()
-                } else {
-                    value.clone()
-                },
-            )
-        }
-    }
+    let arg = if first_path_member_int {
+        &value_at_path
+    } else {
+        &*value
+    };
 
-    let output = eval_block(
-        engine_state,
-        stack,
-        block,
-        input_at_path.into_pipeline_data(),
-        redirect_stdout,
-        redirect_stderr,
-    )?;
+    let new_value = closure
+        .add_arg(arg.clone())
+        .run_with_input(value_at_path.into_pipeline_data())?
+        .into_value(span);
 
-    value.update_data_at_cell_path(cell_path, output.into_value(span))
+    value.update_data_at_cell_path(cell_path, new_value)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_single_value_by_closure(
     value: &mut Value,
-    replacement: Value,
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
+    closure: ClosureEvalOnce,
+    span: Span,
     cell_path: &[PathMember],
     first_path_member_int: bool,
 ) -> Result<(), ShellError> {
-    let span = replacement.span();
-    let capture_block = Closure::from_value(replacement)?;
-    let block = engine_state.get_block(capture_block.block_id);
-    let mut stack = stack.captures_to_stack(capture_block.captures);
+    let value_at_path = value.clone().follow_cell_path(cell_path, false)?;
 
-    update_value_by_closure(
-        value,
-        span,
-        engine_state,
-        &mut stack,
-        redirect_stdout,
-        redirect_stderr,
-        block,
-        cell_path,
-        first_path_member_int,
-    )
+    let arg = if first_path_member_int {
+        &value_at_path
+    } else {
+        &*value
+    };
+
+    let new_value = closure
+        .add_arg(arg.clone())
+        .run_with_input(value_at_path.into_pipeline_data())?
+        .into_value(span);
+
+    value.update_data_at_cell_path(cell_path, new_value)
 }
 
 #[cfg(test)]

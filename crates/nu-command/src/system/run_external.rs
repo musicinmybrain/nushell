@@ -1,30 +1,18 @@
 use nu_cmd_base::hook::eval_hook;
-use nu_engine::env_to_strings;
-use nu_engine::eval_expression;
-use nu_engine::CallExt;
-use nu_protocol::NuGlob;
-use nu_protocol::{
-    ast::{Call, Expr},
-    did_you_mean,
-    engine::{Command, EngineState, Stack},
-    Category, Example, ListStream, PipelineData, RawStream, ShellError, Signature, Span, Spanned,
-    SyntaxShape, Type, Value,
-};
+use nu_engine::{command_prelude::*, env_to_strings, get_eval_expression};
+use nu_protocol::{ast::Expr, did_you_mean, ListStream, NuGlob, OutDest, RawStream};
 use nu_system::ForegroundChild;
 use nu_utils::IgnoreCaseExt;
 use os_pipe::PipeReader;
 use pathdiff::diff_paths;
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command as CommandSys, Stdio};
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{self, SyncSender};
-use std::sync::Arc;
-use std::thread;
-
-const OUTPUT_BUFFER_SIZE: usize = 1024;
-const OUTPUT_BUFFERS_IN_FLIGHT: usize = 3;
+use std::{
+    collections::HashMap,
+    io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+    process::{Command as CommandSys, Stdio},
+    sync::{mpsc, Arc},
+    thread,
+};
 
 #[derive(Clone)]
 pub struct External;
@@ -41,14 +29,6 @@ impl Command for External {
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build(self.name())
             .input_output_types(vec![(Type::Any, Type::Any)])
-            .switch("redirect-stdout", "redirect stdout to the pipeline", None)
-            .switch("redirect-stderr", "redirect stderr to the pipeline", None)
-            .switch(
-                "redirect-combine",
-                "redirect both stdout and stderr combined to the pipeline (collected in stdout)",
-                None,
-            )
-            .switch("trim-end-newline", "trimming end newlines", None)
             .required("command", SyntaxShape::String, "External command to run.")
             .rest("args", SyntaxShape::Any, "Arguments for external command.")
             .category(Category::System)
@@ -61,30 +41,7 @@ impl Command for External {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        let redirect_stdout = call.has_flag(engine_state, stack, "redirect-stdout")?;
-        let redirect_stderr = call.has_flag(engine_state, stack, "redirect-stderr")?;
-        let redirect_combine = call.has_flag(engine_state, stack, "redirect-combine")?;
-        let trim_end_newline = call.has_flag(engine_state, stack, "trim-end-newline")?;
-
-        if redirect_combine && (redirect_stdout || redirect_stderr) {
-            return Err(ShellError::ExternalCommand {
-                label: "Cannot use --redirect-combine with --redirect-stdout or --redirect-stderr"
-                    .into(),
-                help: "use either --redirect-combine or redirect a single output stream".into(),
-                span: call.head,
-            });
-        }
-
-        let command = create_external_command(
-            engine_state,
-            stack,
-            call,
-            redirect_stdout,
-            redirect_stderr,
-            redirect_combine,
-            trim_end_newline,
-        )?;
-
+        let command = create_external_command(engine_state, stack, call)?;
         command.run_with_input(engine_state, stack, input, false)
     }
 
@@ -97,7 +54,12 @@ impl Command for External {
             },
             Example {
                 description: "Redirect stdout from an external command into the pipeline",
-                example: r#"run-external --redirect-stdout "echo" "-n" "hello" | split chars"#,
+                example: r#"run-external "echo" "-n" "hello" | split chars"#,
+                result: None,
+            },
+            Example {
+                description: "Redirect stderr from an external command into the pipeline",
+                example: r#"run-external "nu" "-c" "print -e hello" e>| split chars"#,
                 result: None,
             },
         ]
@@ -109,10 +71,6 @@ pub fn create_external_command(
     engine_state: &EngineState,
     stack: &mut Stack,
     call: &Call,
-    redirect_stdout: bool,
-    redirect_stderr: bool,
-    redirect_combine: bool,
-    trim_end_newline: bool,
 ) -> Result<ExternalCommand, ShellError> {
     let name: Spanned<String> = call.req(engine_state, stack, 0)?;
 
@@ -131,6 +89,8 @@ pub fn create_external_command(
                 span,
             })
     }
+
+    let eval_expression = get_eval_expression(engine_state);
 
     let mut spanned_args = vec![];
     let mut arg_keep_raw = vec![];
@@ -177,11 +137,9 @@ pub fn create_external_command(
         name,
         args: spanned_args,
         arg_keep_raw,
-        redirect_stdout,
-        redirect_stderr,
-        redirect_combine,
+        out: stack.stdout().clone(),
+        err: stack.stderr().clone(),
         env_vars: env_vars_str,
-        trim_end_newline,
     })
 }
 
@@ -190,11 +148,9 @@ pub struct ExternalCommand {
     pub name: Spanned<String>,
     pub args: Vec<Spanned<String>>,
     pub arg_keep_raw: Vec<bool>,
-    pub redirect_stdout: bool,
-    pub redirect_stderr: bool,
-    pub redirect_combine: bool,
+    pub out: OutDest,
+    pub err: OutDest,
     pub env_vars: HashMap<String, String>,
-    pub trim_end_newline: bool,
 }
 
 impl ExternalCommand {
@@ -361,24 +317,41 @@ impl ExternalCommand {
                             let mut engine_state = engine_state.clone();
                             if let Some(hook) = engine_state.config.hooks.command_not_found.clone()
                             {
-                                if let Ok(PipelineData::Value(Value::String { val, .. }, ..)) =
-                                    eval_hook(
-                                        &mut engine_state,
-                                        stack,
-                                        None,
-                                        vec![(
-                                            "cmd_name".into(),
-                                            Value::string(
-                                                self.name.item.to_string(),
-                                                self.name.span,
-                                            ),
-                                        )],
-                                        &hook,
-                                        "command_not_found",
-                                    )
-                                {
-                                    err_str = format!("{}\n{}", err_str, val);
+                                let canary = "ENTERED_COMMAND_NOT_FOUND";
+                                let stack = &mut stack.start_capture();
+                                if stack.has_env_var(&engine_state, canary) {
+                                    return Err(ShellError::ExternalCommand {
+                                        label: "command_not_found handler could not be run".into(),
+                                        help: "make sure the command_not_found closure itself does not use unknown commands".to_string(),
+                                        span: self.name.span,
+                                    });
                                 }
+                                stack.add_env_var(
+                                    canary.to_string(),
+                                    Value::bool(true, Span::unknown()),
+                                );
+                                match eval_hook(
+                                    &mut engine_state,
+                                    stack,
+                                    None,
+                                    vec![(
+                                        "cmd_name".into(),
+                                        Value::string(self.name.item.to_string(), self.name.span),
+                                    )],
+                                    &hook,
+                                    "command_not_found",
+                                ) {
+                                    Ok(PipelineData::Value(Value::String { val, .. }, ..)) => {
+                                        err_str = format!("{}\n{}", err_str, val);
+                                    }
+
+                                    Err(err) => {
+                                        stack.remove_env_var(&engine_state, canary);
+                                        return Err(err);
+                                    }
+                                    _ => {}
+                                }
+                                stack.remove_env_var(&engine_state, canary);
                             }
                         }
 
@@ -402,26 +375,33 @@ impl ExternalCommand {
                     let mut stack = stack.clone();
 
                     // Turn off color as we pass data through
-                    engine_state.config.use_ansi_coloring = false;
+                    Arc::make_mut(&mut engine_state.config).use_ansi_coloring = false;
 
                     // Pipe input into the external command's stdin
                     if let Some(mut stdin_write) = child.as_mut().stdin.take() {
                         thread::Builder::new()
                             .name("external stdin worker".to_string())
                             .spawn(move || {
-                                // Attempt to render the input as a table before piping it to the external.
-                                // This is important for pagers like `less`;
-                                // they need to get Nu data rendered for display to users.
-                                //
-                                // TODO: should we do something different for list<string> inputs?
-                                // Users often expect those to be piped to *nix tools as raw strings separated by newlines
-                                let input = crate::Table::run(
-                                    &crate::Table,
-                                    &engine_state,
-                                    &mut stack,
-                                    &Call::new(head),
-                                    input,
-                                );
+                                let input = match input {
+                                    input @ PipelineData::Value(Value::Binary { .. }, ..) => {
+                                        Ok(input)
+                                    }
+                                    input => {
+                                        let stack = &mut stack.start_capture();
+                                        // Attempt to render the input as a table before piping it to the external.
+                                        // This is important for pagers like `less`;
+                                        // they need to get Nu data rendered for display to users.
+                                        //
+                                        // TODO: should we do something different for list<string> inputs?
+                                        // Users often expect those to be piped to *nix tools as raw strings separated by newlines
+                                        crate::Table.run(
+                                            &engine_state,
+                                            stack,
+                                            &Call::new(head),
+                                            input,
+                                        )
+                                    }
+                                };
 
                                 if let Ok(input) = input {
                                     for value in input.into_iter() {
@@ -438,79 +418,76 @@ impl ExternalCommand {
 
                                 Ok(())
                             })
-                            .expect("Failed to create thread");
+                            .err_span(head)?;
                     }
                 }
 
                 #[cfg(unix)]
                 let commandname = self.name.item.clone();
-                let redirect_stdout = self.redirect_stdout;
-                let redirect_stderr = self.redirect_stderr;
-                let redirect_combine = self.redirect_combine;
                 let span = self.name.span;
-                let output_ctrlc = ctrlc.clone();
-                let stderr_ctrlc = ctrlc.clone();
-                let (stdout_tx, stdout_rx) = mpsc::sync_channel(OUTPUT_BUFFERS_IN_FLIGHT);
                 let (exit_code_tx, exit_code_rx) = mpsc::channel();
 
-                let stdout = child.as_mut().stdout.take();
-                let stderr = child.as_mut().stderr.take();
+                let (stdout, stderr) = if let Some(combined) = reader {
+                    (
+                        Some(RawStream::new(
+                            Box::new(ByteLines::new(combined)),
+                            ctrlc.clone(),
+                            head,
+                            None,
+                        )),
+                        None,
+                    )
+                } else {
+                    let stdout = child.as_mut().stdout.take().map(|out| {
+                        RawStream::new(Box::new(ByteLines::new(out)), ctrlc.clone(), head, None)
+                    });
 
-                // If this external is not the last expression, then its output is piped to a channel
-                // and we create a ListStream that can be consumed
+                    let stderr = child.as_mut().stderr.take().map(|err| {
+                        RawStream::new(Box::new(ByteLines::new(err)), ctrlc.clone(), head, None)
+                    });
 
-                // First create a thread to redirect the external's stdout and wait for an exit code.
+                    if matches!(self.err, OutDest::Pipe) {
+                        (stderr, stdout)
+                    } else {
+                        (stdout, stderr)
+                    }
+                };
+
+                // Create a thread to wait for an exit code.
                 thread::Builder::new()
-                    .name("stdout redirector + exit code waiter".to_string())
-                    .spawn(move || {
-                        if redirect_stdout {
-                            let stdout = stdout.ok_or_else(|| {
-                                ShellError::ExternalCommand { label: "Error taking stdout from external".to_string(), help: "Redirects need access to stdout of an external command"
-                                        .to_string(), span }
-                            })?;
-
-                            read_and_redirect_message(stdout, stdout_tx, ctrlc)
-                        } else if redirect_combine {
-                            let stdout = reader.ok_or_else(|| {
-                                ShellError::ExternalCommand { label: "Error taking combined stdout and stderr from external".to_string(), help: "Combined redirects need access to reader pipe of an external command"
-                                        .to_string(), span }
-                            })?;
-                            read_and_redirect_message(stdout, stdout_tx, ctrlc)
-                        }
-
-                    match child.as_mut().wait() {
-                        Err(err) => Err(ShellError::ExternalCommand { label: "External command exited with error".into(), help: err.to_string(), span }),
+                    .name("exit code waiter".into())
+                    .spawn(move || match child.as_mut().wait() {
+                        Err(err) => Err(ShellError::ExternalCommand {
+                            label: "External command exited with error".into(),
+                            help: err.to_string(),
+                            span,
+                        }),
                         Ok(x) => {
                             #[cfg(unix)]
                             {
+                                use nix::sys::signal::Signal;
                                 use nu_ansi_term::{Color, Style};
-                                use std::ffi::CStr;
                                 use std::os::unix::process::ExitStatusExt;
 
                                 if x.core_dumped() {
-                                    let cause = x.signal().and_then(|sig| unsafe {
-                                        // SAFETY: We should be the first to call `char * strsignal(int sig)`
-                                        let sigstr_ptr = libc::strsignal(sig);
-                                        if sigstr_ptr.is_null() {
-                                            return None;
-                                        }
-
-                                        // SAFETY: The pointer points to a valid non-null string
-                                        let sigstr = CStr::from_ptr(sigstr_ptr);
-                                        sigstr.to_str().map(String::from).ok()
-                                    });
-
-                                    let cause = cause.as_deref().unwrap_or("Something went wrong");
+                                    let cause = x
+                                        .signal()
+                                        .and_then(|sig| {
+                                            Signal::try_from(sig).ok().map(Signal::as_str)
+                                        })
+                                        .unwrap_or("Something went wrong");
 
                                     let style = Style::new().bold().on(Color::Red);
-                                    eprintln!(
-                                        "{}",
-                                        style.paint(format!(
-                                            "{cause}: oops, process '{commandname}' core dumped"
-                                        ))
+                                    let message = format!(
+                                        "{cause}: child process '{commandname}' core dumped"
                                     );
-                                    let _ = exit_code_tx.send(Value::error (
-                                        ShellError::ExternalCommand { label: "core dumped".to_string(), help: format!("{cause}: child process '{commandname}' core dumped"), span: head },
+                                    eprintln!("{}", style.paint(&message));
+                                    let _ = exit_code_tx.send(Value::error(
+                                        ShellError::ExternalCommand {
+                                            label: "core dumped".into(),
+                                            help: message,
+                                            span: head,
+                                        },
                                         head,
                                     ));
                                     return Ok(());
@@ -525,59 +502,21 @@ impl ExternalCommand {
                             }
                             Ok(())
                         }
-                    }
-                }).expect("Failed to create thread");
+                    })
+                    .err_span(head)?;
 
-                let (stderr_tx, stderr_rx) = mpsc::sync_channel(OUTPUT_BUFFERS_IN_FLIGHT);
-                if redirect_stderr {
-                    thread::Builder::new()
-                        .name("stderr redirector".to_string())
-                        .spawn(move || {
-                            let stderr = stderr.ok_or_else(|| ShellError::ExternalCommand {
-                                label: "Error taking stderr from external".to_string(),
-                                help: "Redirects need access to stderr of an external command"
-                                    .to_string(),
-                                span,
-                            })?;
-
-                            read_and_redirect_message(stderr, stderr_tx, stderr_ctrlc);
-                            Ok::<(), ShellError>(())
-                        })
-                        .expect("Failed to create thread");
-                }
-
-                let stdout_receiver = ChannelReceiver::new(stdout_rx);
-                let stderr_receiver = ChannelReceiver::new(stderr_rx);
                 let exit_code_receiver = ValueReceiver::new(exit_code_rx);
 
                 Ok(PipelineData::ExternalStream {
-                    stdout: if redirect_stdout || redirect_combine {
-                        Some(RawStream::new(
-                            Box::new(stdout_receiver),
-                            output_ctrlc.clone(),
-                            head,
-                            None,
-                        ))
-                    } else {
-                        None
-                    },
-                    stderr: if redirect_stderr {
-                        Some(RawStream::new(
-                            Box::new(stderr_receiver),
-                            output_ctrlc.clone(),
-                            head,
-                            None,
-                        ))
-                    } else {
-                        None
-                    },
+                    stdout,
+                    stderr,
                     exit_code: Some(ListStream::from_stream(
                         Box::new(exit_code_receiver),
-                        output_ctrlc,
+                        ctrlc.clone(),
                     )),
                     span: head,
                     metadata: None,
-                    trim_end_newline: self.trim_end_newline,
+                    trim_end_newline: true,
                 })
             }
         }
@@ -618,20 +557,15 @@ impl ExternalCommand {
 
         // If the external is not the last command, its output will get piped
         // either as a string or binary
-        let reader = if self.redirect_combine {
+        let reader = if matches!(self.out, OutDest::Pipe) && matches!(self.err, OutDest::Pipe) {
             let (reader, writer) = os_pipe::pipe()?;
             let writer_clone = writer.try_clone()?;
             process.stdout(writer);
             process.stderr(writer_clone);
             Some(reader)
         } else {
-            if self.redirect_stdout {
-                process.stdout(Stdio::piped());
-            }
-
-            if self.redirect_stderr {
-                process.stderr(Stdio::piped());
-            }
+            process.stdout(Stdio::try_from(&self.out)?);
+            process.stderr(Stdio::try_from(&self.err)?);
             None
         };
 
@@ -711,9 +645,11 @@ fn trim_expand_and_apply_arg(
     // if arg is quoted, like "aa", 'aa', `aa`, or:
     // if arg is a variable or String interpolation, like: $variable_name, $"($variable_name)"
     // `as_a_whole` will be true, so nu won't remove the inner quotes.
-    let (trimmed_args, run_glob_expansion, mut keep_raw) = trim_enclosing_quotes(&arg.item);
+    let (trimmed_args, mut run_glob_expansion, mut keep_raw) = trim_enclosing_quotes(&arg.item);
     if *arg_keep_raw {
         keep_raw = true;
+        // it's a list or a variable, don't run glob expansion either
+        run_glob_expansion = false;
     }
     let mut arg = Spanned {
         item: if keep_raw {
@@ -819,63 +755,27 @@ fn remove_quotes(input: String) -> String {
     }
 }
 
-// read message from given `reader`, and send out through `sender`.
-//
-// `ctrlc` is used to control the process, if ctrl-c is pressed, the read and redirect
-// process will be breaked.
-fn read_and_redirect_message<R>(
-    reader: R,
-    sender: SyncSender<Vec<u8>>,
-    ctrlc: Option<Arc<AtomicBool>>,
-) where
-    R: Read,
-{
-    // read using the BufferReader. It will do so until there is an
-    // error or there are no more bytes to read
-    let mut buf_read = BufReader::with_capacity(OUTPUT_BUFFER_SIZE, reader);
-    while let Ok(bytes) = buf_read.fill_buf() {
-        if bytes.is_empty() {
-            break;
-        }
+struct ByteLines<R: Read>(BufReader<R>);
 
-        // The Cow generated from the function represents the conversion
-        // from bytes to String. If no replacements are required, then the
-        // borrowed value is a proper UTF-8 string. The Owned option represents
-        // a string where the values had to be replaced, thus marking it as bytes
-        let bytes = bytes.to_vec();
-        let length = bytes.len();
-        buf_read.consume(length);
-
-        if nu_utils::ctrl_c::was_pressed(&ctrlc) {
-            break;
-        }
-
-        match sender.send(bytes) {
-            Ok(_) => continue,
-            Err(_) => break,
-        }
+impl<R: Read> ByteLines<R> {
+    fn new(read: R) -> Self {
+        Self(BufReader::new(read))
     }
 }
 
-// Receiver used for the RawStream
-// It implements iterator so it can be used as a RawStream
-struct ChannelReceiver {
-    rx: mpsc::Receiver<Vec<u8>>,
-}
-
-impl ChannelReceiver {
-    pub fn new(rx: mpsc::Receiver<Vec<u8>>) -> Self {
-        Self { rx }
-    }
-}
-
-impl Iterator for ChannelReceiver {
+impl<R: Read> Iterator for ByteLines<R> {
     type Item = Result<Vec<u8>, ShellError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.rx.recv() {
-            Ok(v) => Some(Ok(v)),
-            Err(_) => None,
+        let mut buf = Vec::new();
+        // `read_until` will never stop reading unless `\n` or EOF is encountered,
+        // so let's limit the number of bytes using `take` as the Rust docs suggest.
+        let capacity = self.0.capacity() as u64;
+        let mut reader = (&mut self.0).take(capacity);
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => None,
+            Ok(_) => Some(Ok(buf)),
+            Err(e) => Some(Err(e.into())),
         }
     }
 }

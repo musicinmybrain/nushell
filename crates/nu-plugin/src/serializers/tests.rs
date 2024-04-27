@@ -1,11 +1,13 @@
 macro_rules! generate_tests {
     ($encoder:expr) => {
         use crate::protocol::{
-            CallInfo, CustomValueOp, EvaluatedCall, LabeledError, PipelineDataHeader, PluginCall,
-            PluginCallResponse, PluginCustomValue, PluginInput, PluginOutput, StreamData,
-            StreamMessage,
+            CallInfo, CustomValueOp, EvaluatedCall, PipelineDataHeader, PluginCall,
+            PluginCallResponse, PluginCustomValue, PluginInput, PluginOption, PluginOutput,
+            StreamData,
         };
-        use nu_protocol::{PluginSignature, Span, Spanned, SyntaxShape, Value};
+        use nu_protocol::{
+            LabeledError, PluginSignature, Signature, Span, Spanned, SyntaxShape, Value,
+        };
 
         #[test]
         fn decode_eof() {
@@ -125,7 +127,6 @@ macro_rules! generate_tests {
                 name: name.clone(),
                 call: call.clone(),
                 input: PipelineDataHeader::Value(input.clone()),
-                config: None,
             });
 
             let plugin_input = PluginInput::Call(1, plugin_call);
@@ -177,11 +178,7 @@ macro_rules! generate_tests {
 
             let custom_value_op = PluginCall::CustomValueOp(
                 Spanned {
-                    item: PluginCustomValue {
-                        name: "Foo".into(),
-                        data: data.clone(),
-                        source: None,
-                    },
+                    item: PluginCustomValue::new("Foo".into(), data.clone(), false, None),
                     span,
                 },
                 CustomValueOp::ToBaseValue,
@@ -201,8 +198,8 @@ macro_rules! generate_tests {
 
             match returned {
                 PluginInput::Call(2, PluginCall::CustomValueOp(val, op)) => {
-                    assert_eq!("Foo", val.item.name);
-                    assert_eq!(data, val.item.data);
+                    assert_eq!("Foo", val.item.name());
+                    assert_eq!(data, val.item.data());
                     assert_eq!(span, val.span);
                     #[allow(unreachable_patterns)]
                     match op {
@@ -216,17 +213,20 @@ macro_rules! generate_tests {
 
         #[test]
         fn response_round_trip_signature() {
-            let signature = PluginSignature::build("nu-plugin")
-                .required("first", SyntaxShape::String, "first required")
-                .required("second", SyntaxShape::Int, "second required")
-                .required_named("first-named", SyntaxShape::String, "first named", Some('f'))
-                .required_named(
-                    "second-named",
-                    SyntaxShape::String,
-                    "second named",
-                    Some('s'),
-                )
-                .rest("remaining", SyntaxShape::Int, "remaining");
+            let signature = PluginSignature::new(
+                Signature::build("nu-plugin")
+                    .required("first", SyntaxShape::String, "first required")
+                    .required("second", SyntaxShape::Int, "second required")
+                    .required_named("first-named", SyntaxShape::String, "first named", Some('f'))
+                    .required_named(
+                        "second-named",
+                        SyntaxShape::String,
+                        "second named",
+                        Some('s'),
+                    )
+                    .rest("remaining", SyntaxShape::Int, "remaining"),
+                vec![],
+            );
 
             let response = PluginCallResponse::Signature(vec![signature.clone()]);
             let output = PluginOutput::CallResponse(3, response);
@@ -320,12 +320,13 @@ macro_rules! generate_tests {
             let data = vec![1, 2, 3, 4, 5];
             let span = Span::new(2, 30);
 
-            let value = Value::custom_value(
-                Box::new(PluginCustomValue {
-                    name: name.into(),
-                    data: data.clone(),
-                    source: None,
-                }),
+            let value = Value::custom(
+                Box::new(PluginCustomValue::new(
+                    name.into(),
+                    data.clone(),
+                    true,
+                    None,
+                )),
                 span,
             );
 
@@ -355,8 +356,9 @@ macro_rules! generate_tests {
                         .as_any()
                         .downcast_ref::<PluginCustomValue>()
                     {
-                        assert_eq!(name, plugin_val.name);
-                        assert_eq!(data, plugin_val.data);
+                        assert_eq!(name, plugin_val.name());
+                        assert_eq!(data, plugin_val.data());
+                        assert!(plugin_val.notify_on_drop());
                     } else {
                         panic!("returned CustomValue is not a PluginCustomValue");
                     }
@@ -367,11 +369,15 @@ macro_rules! generate_tests {
 
         #[test]
         fn response_round_trip_error() {
-            let error = LabeledError {
-                label: "label".into(),
-                msg: "msg".into(),
-                span: Some(Span::new(2, 30)),
-            };
+            let error = LabeledError::new("label")
+                .with_code("test::error")
+                .with_url("https://example.org/test/error")
+                .with_help("some help")
+                .with_label("msg", Span::new(2, 30))
+                .with_inner(ShellError::IOError {
+                    msg: "io error".into(),
+                });
+
             let response = PluginCallResponse::Error(error.clone());
             let output = PluginOutput::CallResponse(6, response);
 
@@ -395,11 +401,7 @@ macro_rules! generate_tests {
 
         #[test]
         fn response_round_trip_error_none() {
-            let error = LabeledError {
-                label: "label".into(),
-                msg: "msg".into(),
-                span: None,
-            };
+            let error = LabeledError::new("error");
             let response = PluginCallResponse::Error(error.clone());
             let output = PluginOutput::CallResponse(7, response);
 
@@ -427,7 +429,7 @@ macro_rules! generate_tests {
             let item = Value::int(1, span);
 
             let stream_data = StreamData::List(item.clone());
-            let plugin_input = PluginInput::Stream(StreamMessage::Data(0, stream_data));
+            let plugin_input = PluginInput::Data(0, stream_data);
 
             let encoder = $encoder;
             let mut buffer: Vec<u8> = Vec::new();
@@ -440,7 +442,7 @@ macro_rules! generate_tests {
                 .expect("eof");
 
             match returned {
-                PluginInput::Stream(StreamMessage::Data(id, StreamData::List(list_data))) => {
+                PluginInput::Data(id, StreamData::List(list_data)) => {
                     assert_eq!(0, id);
                     assert_eq!(item, list_data);
                 }
@@ -453,7 +455,7 @@ macro_rules! generate_tests {
             let data = b"Hello world";
 
             let stream_data = StreamData::Raw(Ok(data.to_vec()));
-            let plugin_input = PluginInput::Stream(StreamMessage::Data(1, stream_data));
+            let plugin_input = PluginInput::Data(1, stream_data);
 
             let encoder = $encoder;
             let mut buffer: Vec<u8> = Vec::new();
@@ -466,7 +468,7 @@ macro_rules! generate_tests {
                 .expect("eof");
 
             match returned {
-                PluginInput::Stream(StreamMessage::Data(id, StreamData::Raw(bytes))) => {
+                PluginInput::Data(id, StreamData::Raw(bytes)) => {
                     assert_eq!(1, id);
                     match bytes {
                         Ok(bytes) => assert_eq!(data, &bytes[..]),
@@ -483,7 +485,7 @@ macro_rules! generate_tests {
             let item = Value::int(1, span);
 
             let stream_data = StreamData::List(item.clone());
-            let plugin_output = PluginOutput::Stream(StreamMessage::Data(4, stream_data));
+            let plugin_output = PluginOutput::Data(4, stream_data);
 
             let encoder = $encoder;
             let mut buffer: Vec<u8> = Vec::new();
@@ -496,7 +498,7 @@ macro_rules! generate_tests {
                 .expect("eof");
 
             match returned {
-                PluginOutput::Stream(StreamMessage::Data(id, StreamData::List(list_data))) => {
+                PluginOutput::Data(id, StreamData::List(list_data)) => {
                     assert_eq!(4, id);
                     assert_eq!(item, list_data);
                 }
@@ -509,7 +511,7 @@ macro_rules! generate_tests {
             let data = b"Hello world";
 
             let stream_data = StreamData::Raw(Ok(data.to_vec()));
-            let plugin_output = PluginOutput::Stream(StreamMessage::Data(5, stream_data));
+            let plugin_output = PluginOutput::Data(5, stream_data);
 
             let encoder = $encoder;
             let mut buffer: Vec<u8> = Vec::new();
@@ -522,12 +524,34 @@ macro_rules! generate_tests {
                 .expect("eof");
 
             match returned {
-                PluginOutput::Stream(StreamMessage::Data(id, StreamData::Raw(bytes))) => {
+                PluginOutput::Data(id, StreamData::Raw(bytes)) => {
                     assert_eq!(5, id);
                     match bytes {
                         Ok(bytes) => assert_eq!(data, &bytes[..]),
                         Err(err) => panic!("decoded into error variant: {err:?}"),
                     }
+                }
+                _ => panic!("decoded into wrong value: {returned:?}"),
+            }
+        }
+
+        #[test]
+        fn output_round_trip_option() {
+            let plugin_output = PluginOutput::Option(PluginOption::GcDisabled(true));
+
+            let encoder = $encoder;
+            let mut buffer: Vec<u8> = Vec::new();
+            encoder
+                .encode(&plugin_output, &mut buffer)
+                .expect("unable to serialize message");
+            let returned = encoder
+                .decode(&mut buffer.as_slice())
+                .expect("unable to deserialize message")
+                .expect("eof");
+
+            match returned {
+                PluginOutput::Option(PluginOption::GcDisabled(disabled)) => {
+                    assert!(disabled);
                 }
                 _ => panic!("decoded into wrong value: {returned:?}"),
             }

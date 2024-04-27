@@ -1,24 +1,13 @@
 use super::util::get_rest_for_glob_pattern;
-use nu_engine::{current_dir, eval_block, CallExt};
-use nu_path::expand_to_real_path;
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::util::BufferedReader;
-use nu_protocol::{
-    Category, DataSource, Example, IntoInterruptiblePipelineData, NuGlob, PipelineData,
-    PipelineMetadata, RawStream, ShellError, Signature, Spanned, SyntaxShape, Type,
-};
-use std::io::BufReader;
+use nu_engine::{command_prelude::*, current_dir, get_eval_block};
+use nu_protocol::{BufferedReader, DataSource, NuGlob, PipelineMetadata, RawStream};
+use std::{io::BufReader, path::Path};
 
 #[cfg(feature = "sqlite")]
 use crate::database::SQLiteDatabase;
 
-#[cfg(feature = "sqlite")]
-use nu_protocol::IntoPipelineData;
-
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 
 #[derive(Clone)]
 pub struct Open;
@@ -43,7 +32,11 @@ impl Command for Open {
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("open")
             .input_output_types(vec![(Type::Nothing, Type::Any), (Type::String, Type::Any)])
-            .rest("files", SyntaxShape::GlobPattern, "The file(s) to open.")
+            .rest(
+                "files",
+                SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
+                "The file(s) to open.",
+            )
             .switch("raw", "open file as raw binary", Some('r'))
             .category(Category::FileSystem)
     }
@@ -60,6 +53,7 @@ impl Command for Open {
         let ctrlc = engine_state.ctrlc.clone();
         let cwd = current_dir(engine_state, stack)?;
         let mut paths = get_rest_for_glob_pattern(engine_state, stack, call, 0)?;
+        let eval_block = get_eval_block(engine_state);
 
         if paths.is_empty() && call.rest_iter(0).next().is_none() {
             // try to use path from pipeline input if there were no positional or spread args
@@ -148,11 +142,10 @@ impl Command for Open {
                     };
 
                     let buf_reader = BufReader::new(file);
-                    let real_path = expand_to_real_path(path);
 
                     let file_contents = PipelineData::ExternalStream {
                         stdout: Some(RawStream::new(
-                            Box::new(BufferedReader { input: buf_reader }),
+                            Box::new(BufferedReader::new(buf_reader)),
                             ctrlc.clone(),
                             call_span,
                             None,
@@ -161,7 +154,7 @@ impl Command for Open {
                         exit_code: None,
                         span: call_span,
                         metadata: Some(PipelineMetadata {
-                            data_source: DataSource::FilePath(real_path),
+                            data_source: DataSource::FilePath(path.to_path_buf()),
                         }),
                         trim_end_newline: false,
                     };
@@ -189,7 +182,7 @@ impl Command for Open {
                             let decl = engine_state.get_decl(converter_id);
                             let command_output = if let Some(block_id) = decl.get_block_id() {
                                 let block = engine_state.get_block(block_id);
-                                eval_block(engine_state, stack, block, file_contents, false, false)
+                                eval_block(engine_state, stack, block, file_contents)
                             } else {
                                 decl.run(engine_state, stack, &Call::new(call_span), file_contents)
                             };

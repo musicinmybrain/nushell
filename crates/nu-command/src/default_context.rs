@@ -1,9 +1,6 @@
+use crate::*;
 use nu_protocol::engine::{EngineState, StateWorkingSet};
 
-use crate::{
-    help::{HelpAliases, HelpCommands, HelpEscapes, HelpExterns, HelpModules, HelpOperators},
-    *,
-};
 pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
     let delta = {
         let mut working_set = StateWorkingSet::new(&engine_state);
@@ -41,7 +38,6 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             DropColumn,
             DropNth,
             Each,
-            Empty,
             Enumerate,
             Every,
             Filter,
@@ -53,6 +49,9 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             GroupBy,
             Headers,
             Insert,
+            IsEmpty,
+            IsNotEmpty,
+            Interleave,
             Items,
             Join,
             SplitBy,
@@ -79,6 +78,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Sort,
             SortBy,
             SplitList,
+            Tee,
             Transpose,
             Uniq,
             UniqBy,
@@ -119,6 +119,8 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Exec,
             NuCheck,
             Sys,
+            UName,
+
         };
 
         // Help
@@ -137,9 +139,11 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Ast,
             Debug,
             DebugInfo,
+            DebugProfile,
             Explain,
             Inspect,
             Metadata,
+            MetadataSet,
             TimeIt,
             View,
             ViewFiles,
@@ -175,7 +179,6 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             SplitColumn,
             SplitRow,
             SplitWords,
-            StrEscapeGlob,
             Str,
             StrCapitalize,
             StrContains,
@@ -203,10 +206,8 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         bind_command! {
             Cd,
             Ls,
-            Mkdir,
             UMkdir,
             Mktemp,
-            Mv,
             UMv,
             UCp,
             Open,
@@ -259,6 +260,8 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             From,
             FromCsv,
             FromJson,
+            FromMsgpack,
+            FromMsgpackz,
             FromNuon,
             FromOds,
             FromSsv,
@@ -272,6 +275,8 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             ToCsv,
             ToJson,
             ToMd,
+            ToMsgpack,
+            ToMsgpackz,
             ToNuon,
             ToText,
             ToToml,

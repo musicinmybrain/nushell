@@ -1,9 +1,7 @@
+use super::PluginCustomValue;
+use crate::plugin::PluginSource;
 use nu_protocol::{CustomValue, ShellError, Span, Value};
 use serde::{Deserialize, Serialize};
-
-use crate::plugin::PluginIdentity;
-
-use super::PluginCustomValue;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TestCustomValue(pub i32);
@@ -11,10 +9,10 @@ pub(crate) struct TestCustomValue(pub i32);
 #[typetag::serde]
 impl CustomValue for TestCustomValue {
     fn clone_value(&self, span: Span) -> Value {
-        Value::custom_value(Box::new(self.clone()), span)
+        Value::custom(Box::new(self.clone()), span)
     }
 
-    fn value_string(&self) -> String {
+    fn type_name(&self) -> String {
         "TestCustomValue".into()
     }
 
@@ -25,17 +23,17 @@ impl CustomValue for TestCustomValue {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 pub(crate) fn test_plugin_custom_value() -> PluginCustomValue {
     let data = bincode::serialize(&expected_test_custom_value() as &dyn CustomValue)
         .expect("bincode serialization of the expected_test_custom_value() failed");
 
-    PluginCustomValue {
-        name: "TestCustomValue".into(),
-        data,
-        source: None,
-    }
+    PluginCustomValue::new("TestCustomValue".into(), data, false, None)
 }
 
 pub(crate) fn expected_test_custom_value() -> TestCustomValue {
@@ -43,8 +41,5 @@ pub(crate) fn expected_test_custom_value() -> TestCustomValue {
 }
 
 pub(crate) fn test_plugin_custom_value_with_source() -> PluginCustomValue {
-    PluginCustomValue {
-        source: Some(PluginIdentity::new_fake("test")),
-        ..test_plugin_custom_value()
-    }
+    test_plugin_custom_value().with_source(Some(PluginSource::new_fake("test").into()))
 }

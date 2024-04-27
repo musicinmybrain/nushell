@@ -1,5 +1,13 @@
 //! Implements the stream multiplexing interface for both the plugin side and the engine side.
 
+use crate::{
+    plugin::Encoder,
+    protocol::{
+        ExternalStreamInfo, ListStreamInfo, PipelineDataHeader, RawStreamInfo, StreamMessage,
+    },
+    sequence::Sequence,
+};
+use nu_protocol::{ListStream, PipelineData, RawStream, ShellError};
 use std::{
     io::Write,
     sync::{
@@ -9,23 +17,13 @@ use std::{
     thread,
 };
 
-use nu_protocol::{ListStream, PipelineData, RawStream, ShellError};
-
-use crate::{
-    plugin::Encoder,
-    protocol::{
-        ExternalStreamInfo, ListStreamInfo, PipelineDataHeader, RawStreamInfo, StreamMessage,
-    },
-    sequence::Sequence,
-};
-
 mod stream;
 
 mod engine;
-pub(crate) use engine::{EngineInterfaceManager, ReceivedPluginCall};
+pub use engine::{EngineInterface, EngineInterfaceManager, ReceivedPluginCall};
 
 mod plugin;
-pub(crate) use plugin::{PluginInterface, PluginInterfaceManager};
+pub use plugin::{PluginInterface, PluginInterfaceManager};
 
 use self::stream::{StreamManager, StreamManagerHandle, StreamWriter, WriteStreamMessage};
 
@@ -44,7 +42,10 @@ const LIST_STREAM_HIGH_PRESSURE: i32 = 100;
 const RAW_STREAM_HIGH_PRESSURE: i32 = 50;
 
 /// Read input/output from the stream.
-pub(crate) trait PluginRead<T> {
+///
+/// This is not a public API.
+#[doc(hidden)]
+pub trait PluginRead<T> {
     /// Returns `Ok(None)` on end of stream.
     fn read(&mut self) -> Result<Option<T>, ShellError>;
 }
@@ -71,11 +72,19 @@ where
 /// Write input/output to the stream.
 ///
 /// The write should be atomic, without interference from other threads.
-pub(crate) trait PluginWrite<T>: Send + Sync {
+///
+/// This is not a public API.
+#[doc(hidden)]
+pub trait PluginWrite<T>: Send + Sync {
     fn write(&self, data: &T) -> Result<(), ShellError>;
 
     /// Flush any internal buffers, if applicable.
     fn flush(&self) -> Result<(), ShellError>;
+
+    /// True if this output is stdout, so that plugins can avoid using stdout for their own purpose
+    fn is_stdout(&self) -> bool {
+        false
+    }
 }
 
 impl<E, T> PluginWrite<T> for (std::io::Stdout, E)
@@ -91,6 +100,10 @@ where
         self.0.lock().flush().map_err(|err| ShellError::IOError {
             msg: err.to_string(),
         })
+    }
+
+    fn is_stdout(&self) -> bool {
+        true
     }
 }
 
@@ -127,6 +140,10 @@ where
     fn flush(&self) -> Result<(), ShellError> {
         (**self).flush()
     }
+
+    fn is_stdout(&self) -> bool {
+        (**self).is_stdout()
+    }
 }
 
 /// An interface manager handles I/O and state management for communication between a plugin and the
@@ -135,7 +152,10 @@ where
 ///
 /// There is typically one [`InterfaceManager`] consuming input from a background thread, and
 /// managing shared state.
-pub(crate) trait InterfaceManager {
+///
+/// This is not a public API.
+#[doc(hidden)]
+pub trait InterfaceManager {
     /// The corresponding interface type.
     type Interface: Interface + 'static;
 
@@ -217,9 +237,15 @@ pub(crate) trait InterfaceManager {
 /// [`EngineInterface`] for the API from the plugin side to the engine.
 ///
 /// There can be multiple copies of the interface managed by a single [`InterfaceManager`].
-pub(crate) trait Interface: Clone + Send {
+///
+/// This is not a public API.
+#[doc(hidden)]
+pub trait Interface: Clone + Send {
     /// The output message type, which must be capable of encapsulating a [`StreamMessage`].
     type Output: From<StreamMessage>;
+
+    /// Any context required to construct [`PipelineData`]. Can be `()` if not needed.
+    type DataContext;
 
     /// Write an output message.
     fn write(&self, output: Self::Output) -> Result<(), ShellError>;
@@ -235,7 +261,11 @@ pub(crate) trait Interface: Clone + Send {
 
     /// Prepare [`PipelineData`] to be written. This is called by `init_write_pipeline_data()` as
     /// a hook so that values that need special handling can be taken care of.
-    fn prepare_pipeline_data(&self, data: PipelineData) -> Result<PipelineData, ShellError>;
+    fn prepare_pipeline_data(
+        &self,
+        data: PipelineData,
+        context: &Self::DataContext,
+    ) -> Result<PipelineData, ShellError>;
 
     /// Initialize a write for [`PipelineData`]. This returns two parts: the header, which can be
     /// embedded in the particular message that references the stream, and a writer, which will
@@ -248,6 +278,7 @@ pub(crate) trait Interface: Clone + Send {
     fn init_write_pipeline_data(
         &self,
         data: PipelineData,
+        context: &Self::DataContext,
     ) -> Result<(PipelineDataHeader, PipelineDataWriter<Self>), ShellError> {
         // Allocate a stream id and a writer
         let new_stream = |high_pressure_mark: i32| {
@@ -259,7 +290,7 @@ pub(crate) trait Interface: Clone + Send {
                     .write_stream(id, self.clone(), high_pressure_mark)?;
             Ok::<_, ShellError>((id, writer))
         };
-        match self.prepare_pipeline_data(data)? {
+        match self.prepare_pipeline_data(data, context)? {
             PipelineData::Value(value, _) => {
                 Ok((PipelineDataHeader::Value(value), PipelineDataWriter::None))
             }
@@ -337,7 +368,7 @@ where
 /// [`PipelineDataWriter::write()`] to write all of the data contained within the streams.
 #[derive(Default)]
 #[must_use]
-pub(crate) enum PipelineDataWriter<W: WriteStreamMessage> {
+pub enum PipelineDataWriter<W: WriteStreamMessage> {
     #[default]
     None,
     ListStream(StreamWriter<W>, ListStream),
@@ -369,18 +400,22 @@ where
                 exit_code,
             } => {
                 thread::scope(|scope| {
-                    let stderr_thread = stderr.map(|(mut writer, stream)| {
-                        thread::Builder::new()
-                            .name("plugin stderr writer".into())
-                            .spawn_scoped(scope, move || writer.write_all(raw_stream_iter(stream)))
-                            .expect("failed to spawn thread")
-                    });
-                    let exit_code_thread = exit_code.map(|(mut writer, stream)| {
-                        thread::Builder::new()
-                            .name("plugin exit_code writer".into())
-                            .spawn_scoped(scope, move || writer.write_all(stream))
-                            .expect("failed to spawn thread")
-                    });
+                    let stderr_thread = stderr
+                        .map(|(mut writer, stream)| {
+                            thread::Builder::new()
+                                .name("plugin stderr writer".into())
+                                .spawn_scoped(scope, move || {
+                                    writer.write_all(raw_stream_iter(stream))
+                                })
+                        })
+                        .transpose()?;
+                    let exit_code_thread = exit_code
+                        .map(|(mut writer, stream)| {
+                            thread::Builder::new()
+                                .name("plugin exit_code writer".into())
+                                .spawn_scoped(scope, move || writer.write_all(stream))
+                        })
+                        .transpose()?;
                     // Optimize for stdout: if only stdout is present, don't spawn any other
                     // threads.
                     if let Some((mut writer, stream)) = stdout {
@@ -407,10 +442,12 @@ where
 
     /// Write all of the data in each of the streams. This method returns immediately; any necessary
     /// write will happen in the background. If a thread was spawned, its handle is returned.
-    pub(crate) fn write_background(self) -> Option<thread::JoinHandle<Result<(), ShellError>>> {
+    pub(crate) fn write_background(
+        self,
+    ) -> Result<Option<thread::JoinHandle<Result<(), ShellError>>>, ShellError> {
         match self {
-            PipelineDataWriter::None => None,
-            _ => Some(
+            PipelineDataWriter::None => Ok(None),
+            _ => Ok(Some(
                 thread::Builder::new()
                     .name("plugin stream background writer".into())
                     .spawn(move || {
@@ -421,9 +458,8 @@ where
                             log::warn!("Error while writing pipeline in background: {err}");
                         }
                         result
-                    })
-                    .expect("failed to spawn thread"),
-            ),
+                    })?,
+            )),
         }
     }
 }

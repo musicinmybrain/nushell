@@ -1,11 +1,6 @@
 use nu_cmd_base::input_handler::{operate, CmdArgument};
-use nu_engine::CallExt;
-use nu_protocol::{
-    ast::{Call, CellPath},
-    engine::{Command, EngineState, Stack},
-    into_code, Category, Config, Example, IntoPipelineData, PipelineData, ShellError, Signature,
-    Span, SyntaxShape, Type, Value,
-};
+use nu_engine::command_prelude::*;
+use nu_protocol::{into_code, Config};
 use nu_utils::get_system_locale;
 use num_format::ToFormattedString;
 
@@ -45,8 +40,8 @@ impl Command for SubCommand {
                     Type::List(Box::new(Type::Any)),
                     Type::List(Box::new(Type::String)),
                 ),
-                (Type::Table(vec![]), Type::Table(vec![])),
-                (Type::Record(vec![]), Type::Record(vec![])),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
             ])
             .allow_variants_without_examples(true) // https://github.com/nushell/nushell/issues/7032
             .rest(
@@ -231,6 +226,21 @@ fn action(input: &Value, args: &Arguments, span: Span) -> Value {
             },
             span,
         ),
+        Value::Custom { val, .. } => {
+            // Only custom values that have a base value that can be converted to string are
+            // accepted.
+            val.to_base_value(input.span())
+                .and_then(|base_value| match action(&base_value, args, span) {
+                    Value::Error { .. } => Err(ShellError::CantConvert {
+                        to_type: String::from("string"),
+                        from_type: val.type_name(),
+                        span,
+                        help: Some("this custom value can't be represented as a string".into()),
+                    }),
+                    success => Ok(success),
+                })
+                .unwrap_or_else(|err| Value::error(err, span))
+        }
         x => Value::error(
             ShellError::CantConvert {
                 to_type: String::from("string"),

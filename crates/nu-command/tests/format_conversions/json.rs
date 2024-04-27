@@ -229,9 +229,43 @@ fn unbounded_from_in_range_fails() {
 #[test]
 fn inf_in_range_fails() {
     let actual = nu!(r#"inf..5 | to json"#);
-    assert!(actual.err.contains("Cannot create range"));
+    assert!(actual.err.contains("can't convert to countable values"));
     let actual = nu!(r#"5..inf | to json"#);
-    assert!(actual.err.contains("Cannot create range"));
+    assert!(actual
+        .err
+        .contains("Unbounded ranges are not allowed when converting to this format"));
     let actual = nu!(r#"-inf..inf | to json"#);
-    assert!(actual.err.contains("Cannot create range"));
+    assert!(actual.err.contains("can't convert to countable values"));
+}
+
+#[test]
+fn test_indent_flag() {
+    let actual = nu!(
+    cwd: "tests/fixtures/formats", pipeline(
+    r#"
+        echo '{ "a": 1, "b": 2, "c": 3 }'
+        | from json
+        | to json --indent 3
+    "#
+    ));
+
+    let expected_output = "{   \"a\": 1,   \"b\": 2,   \"c\": 3}";
+
+    assert_eq!(actual.out, expected_output);
+}
+
+#[test]
+fn test_tabs_indent_flag() {
+    let actual = nu!(
+    cwd: "tests/fixtures/formats", pipeline(
+    r#"
+        echo '{ "a": 1, "b": 2, "c": 3 }'
+        | from json
+        | to json --tabs 2
+    "#
+    ));
+
+    let expected_output = "{\t\t\"a\": 1,\t\t\"b\": 2,\t\t\"c\": 3}";
+
+    assert_eq!(actual.out, expected_output);
 }

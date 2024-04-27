@@ -1,9 +1,14 @@
-use std::collections::{HashMap, HashSet};
-
-use crate::engine::EngineState;
-use crate::engine::DEFAULT_OVERLAY_NAME;
-use crate::{ShellError, Span, Value, VarId};
-use crate::{ENV_VARIABLE_ID, NU_VARIABLE_ID};
+use crate::{
+    engine::{
+        EngineState, Redirection, StackCallArgGuard, StackCaptureGuard, StackIoGuard, StackOutDest,
+        DEFAULT_OVERLAY_NAME,
+    },
+    OutDest, ShellError, Span, Value, VarId, ENV_VARIABLE_ID, NU_VARIABLE_ID,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 /// Environment variables per overlay
 pub type EnvVars = HashMap<String, HashMap<String, Value>>;
@@ -36,17 +41,97 @@ pub struct Stack {
     /// List of active overlays
     pub active_overlays: Vec<String>,
     pub recursion_count: u64,
+    pub parent_stack: Option<Arc<Stack>>,
+    /// Variables that have been deleted (this is used to hide values from parent stack lookups)
+    pub parent_deletions: Vec<VarId>,
+    pub(crate) out_dest: StackOutDest,
+}
+
+impl Default for Stack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Stack {
-    pub fn new() -> Stack {
-        Stack {
-            vars: vec![],
-            env_vars: vec![],
+    /// Create a new stack.
+    ///
+    /// stdout and stderr will be set to [`OutDest::Inherit`]. So, if the last command is an external command,
+    /// then its output will be forwarded to the terminal/stdio streams.
+    ///
+    /// Use [`Stack::capture`] afterwards if you need to evaluate an expression to a [`Value`](crate::Value)
+    /// (as opposed to a [`PipelineData`](crate::PipelineData)).
+    pub fn new() -> Self {
+        Self {
+            vars: Vec::new(),
+            env_vars: Vec::new(),
             env_hidden: HashMap::new(),
             active_overlays: vec![DEFAULT_OVERLAY_NAME.to_string()],
             recursion_count: 0,
+            parent_stack: None,
+            parent_deletions: vec![],
+            out_dest: StackOutDest::new(),
         }
+    }
+
+    /// Unwrap a uniquely-owned stack.
+    ///
+    /// In debug mode, this panics if there are multiple references.
+    /// In production this will instead clone the underlying stack.
+    pub fn unwrap_unique(stack_arc: Arc<Stack>) -> Stack {
+        // If you hit an error here, it's likely that you created an extra
+        // Arc pointing to the stack somewhere. Make sure that it gets dropped before
+        // getting here!
+        Arc::try_unwrap(stack_arc).unwrap_or_else(|arc| {
+            // in release mode, we clone the stack, but this can lead to
+            // major performance issues, so we should avoid it
+            debug_assert!(false, "More than one stack reference remaining!");
+            (*arc).clone()
+        })
+    }
+
+    /// Create a new child stack from a parent.
+    ///
+    /// Changes from this child can be merged back into the parent with
+    /// Stack::with_changes_from_child
+    pub fn with_parent(parent: Arc<Stack>) -> Stack {
+        Stack {
+            // here we are still cloning environment variable-related information
+            env_vars: parent.env_vars.clone(),
+            env_hidden: parent.env_hidden.clone(),
+            active_overlays: parent.active_overlays.clone(),
+            recursion_count: parent.recursion_count,
+            vars: vec![],
+            parent_deletions: vec![],
+            out_dest: parent.out_dest.clone(),
+            parent_stack: Some(parent),
+        }
+    }
+
+    /// Take an Arc of a parent (assumed to be unique), and a child, and apply
+    /// all the changes from a child back to the parent.
+    ///
+    /// Here it is assumed that child was created with a call to Stack::with_parent
+    /// with parent
+    pub fn with_changes_from_child(parent: Arc<Stack>, child: Stack) -> Stack {
+        // we're going to drop the link to the parent stack on our new stack
+        // so that we can unwrap the Arc as a unique reference
+        //
+        // This makes the new_stack be in a bit of a weird state, so we shouldn't call
+        // any structs
+        drop(child.parent_stack);
+        let mut unique_stack = Stack::unwrap_unique(parent);
+
+        unique_stack
+            .vars
+            .retain(|(var, _)| !child.parent_deletions.contains(var));
+        for (var, value) in child.vars {
+            unique_stack.add_var(var, value);
+        }
+        unique_stack.env_vars = child.env_vars;
+        unique_stack.env_hidden = child.env_hidden;
+        unique_stack.active_overlays = child.active_overlays;
+        unique_stack
     }
 
     pub fn with_env(
@@ -56,42 +141,60 @@ impl Stack {
     ) {
         // Do not clone the environment if it hasn't changed
         if self.env_vars.iter().any(|scope| !scope.is_empty()) {
-            self.env_vars = env_vars.to_owned();
+            env_vars.clone_into(&mut self.env_vars);
         }
 
         if !self.env_hidden.is_empty() {
-            self.env_hidden = env_hidden.to_owned();
+            self.env_hidden.clone_from(env_hidden);
         }
     }
 
+    /// Lookup a variable, returning None if it is not present
+    fn lookup_var(&self, var_id: VarId) -> Option<Value> {
+        for (id, val) in &self.vars {
+            if var_id == *id {
+                return Some(val.clone());
+            }
+        }
+
+        if let Some(stack) = &self.parent_stack {
+            if !self.parent_deletions.contains(&var_id) {
+                return stack.lookup_var(var_id);
+            }
+        }
+        None
+    }
+
+    /// Lookup a variable, erroring if it is not found
+    ///
+    /// The passed-in span will be used to tag the value
     pub fn get_var(&self, var_id: VarId, span: Span) -> Result<Value, ShellError> {
-        for (id, val) in &self.vars {
-            if var_id == *id {
-                return Ok(val.clone().with_span(span));
-            }
+        match self.lookup_var(var_id) {
+            Some(v) => Ok(v.with_span(span)),
+            None => Err(ShellError::VariableNotFoundAtRuntime { span }),
         }
-
-        Err(ShellError::VariableNotFoundAtRuntime { span })
     }
 
+    /// Lookup a variable, erroring if it is not found
+    ///
+    /// While the passed-in span will be used for errors, the returned value
+    /// has the span from where it was originally defined
     pub fn get_var_with_origin(&self, var_id: VarId, span: Span) -> Result<Value, ShellError> {
-        for (id, val) in &self.vars {
-            if var_id == *id {
-                return Ok(val.clone());
+        match self.lookup_var(var_id) {
+            Some(v) => Ok(v),
+            None => {
+                if var_id == NU_VARIABLE_ID || var_id == ENV_VARIABLE_ID {
+                    return Err(ShellError::GenericError {
+                        error: "Built-in variables `$env` and `$nu` have no metadata".into(),
+                        msg: "no metadata available".into(),
+                        span: Some(span),
+                        help: None,
+                        inner: vec![],
+                    });
+                }
+                Err(ShellError::VariableNotFoundAtRuntime { span })
             }
         }
-
-        if var_id == NU_VARIABLE_ID || var_id == ENV_VARIABLE_ID {
-            return Err(ShellError::GenericError {
-                error: "Built-in variables `$env` and `$nu` have no metadata".into(),
-                msg: "no metadata available".into(),
-                span: Some(span),
-                help: None,
-                inner: vec![],
-            });
-        }
-
-        Err(ShellError::VariableNotFoundAtRuntime { span })
     }
 
     pub fn add_var(&mut self, var_id: VarId, value: Value) {
@@ -109,8 +212,13 @@ impl Stack {
         for (idx, (id, _)) in self.vars.iter().enumerate() {
             if *id == var_id {
                 self.vars.remove(idx);
-                return;
+                break;
             }
+        }
+        // even if we did have it in the original layer, we need to make sure to remove it here
+        // as well (since the previous update might have simply hid the parent value)
+        if self.parent_stack.is_some() {
+            self.parent_deletions.push(var_id);
         }
     }
 
@@ -150,6 +258,10 @@ impl Stack {
     }
 
     pub fn captures_to_stack(&self, captures: Vec<(VarId, Value)>) -> Stack {
+        self.captures_to_stack_preserve_out_dest(captures).capture()
+    }
+
+    pub fn captures_to_stack_preserve_out_dest(&self, captures: Vec<(VarId, Value)>) -> Stack {
         // FIXME: this is probably slow
         let mut env_vars = self.env_vars.clone();
         env_vars.push(HashMap::new());
@@ -160,6 +272,9 @@ impl Stack {
             env_hidden: self.env_hidden.clone(),
             active_overlays: self.active_overlays.clone(),
             recursion_count: self.recursion_count,
+            parent_stack: None,
+            parent_deletions: vec![],
+            out_dest: self.out_dest.clone(),
         }
     }
 
@@ -187,6 +302,9 @@ impl Stack {
             env_hidden: self.env_hidden.clone(),
             active_overlays: self.active_overlays.clone(),
             recursion_count: self.recursion_count,
+            parent_stack: None,
+            parent_deletions: vec![],
+            out_dest: self.out_dest.clone(),
         }
     }
 
@@ -308,7 +426,6 @@ impl Stack {
                 }
             }
         }
-
         None
     }
 
@@ -393,10 +510,190 @@ impl Stack {
     pub fn remove_overlay(&mut self, name: &str) {
         self.active_overlays.retain(|o| o != name);
     }
+
+    /// Returns the [`OutDest`] to use for the current command's stdout.
+    ///
+    /// This will be the pipe redirection if one is set,
+    /// otherwise it will be the current file redirection,
+    /// otherwise it will be the process's stdout indicated by [`OutDest::Inherit`].
+    pub fn stdout(&self) -> &OutDest {
+        self.out_dest.stdout()
+    }
+
+    /// Returns the [`OutDest`] to use for the current command's stderr.
+    ///
+    /// This will be the pipe redirection if one is set,
+    /// otherwise it will be the current file redirection,
+    /// otherwise it will be the process's stderr indicated by [`OutDest::Inherit`].
+    pub fn stderr(&self) -> &OutDest {
+        self.out_dest.stderr()
+    }
+
+    /// Returns the [`OutDest`] of the pipe redirection applied to the current command's stdout.
+    pub fn pipe_stdout(&self) -> Option<&OutDest> {
+        self.out_dest.pipe_stdout.as_ref()
+    }
+
+    /// Returns the [`OutDest`] of the pipe redirection applied to the current command's stderr.
+    pub fn pipe_stderr(&self) -> Option<&OutDest> {
+        self.out_dest.pipe_stderr.as_ref()
+    }
+
+    /// Temporarily set the pipe stdout redirection to [`OutDest::Capture`].
+    ///
+    /// This is used before evaluating an expression into a `Value`.
+    pub fn start_capture(&mut self) -> StackCaptureGuard {
+        StackCaptureGuard::new(self)
+    }
+
+    /// Temporarily use the output redirections in the parent scope.
+    ///
+    /// This is used before evaluating an argument to a call.
+    pub fn use_call_arg_out_dest(&mut self) -> StackCallArgGuard {
+        StackCallArgGuard::new(self)
+    }
+
+    /// Temporarily apply redirections to stdout and/or stderr.
+    pub fn push_redirection(
+        &mut self,
+        stdout: Option<Redirection>,
+        stderr: Option<Redirection>,
+    ) -> StackIoGuard {
+        StackIoGuard::new(self, stdout, stderr)
+    }
+
+    /// Mark stdout for the last command as [`OutDest::Capture`].
+    ///
+    /// This will irreversibly alter the output redirections, and so it only makes sense to use this on an owned `Stack`
+    /// (which is why this function does not take `&mut self`).
+    ///
+    /// See [`Stack::start_capture`] which can temporarily set stdout as [`OutDest::Capture`] for a mutable `Stack` reference.
+    pub fn capture(mut self) -> Self {
+        self.out_dest.pipe_stdout = Some(OutDest::Capture);
+        self.out_dest.pipe_stderr = None;
+        self
+    }
+
+    /// Clears any pipe and file redirections and resets stdout and stderr to [`OutDest::Inherit`].
+    ///
+    /// This will irreversibly reset the output redirections, and so it only makes sense to use this on an owned `Stack`
+    /// (which is why this function does not take `&mut self`).
+    pub fn reset_out_dest(mut self) -> Self {
+        self.out_dest = StackOutDest::new();
+        self
+    }
+
+    /// Clears any pipe redirections, keeping the current stdout and stderr.
+    ///
+    /// This will irreversibly reset some of the output redirections, and so it only makes sense to use this on an owned `Stack`
+    /// (which is why this function does not take `&mut self`).
+    pub fn reset_pipes(mut self) -> Self {
+        self.out_dest.pipe_stdout = None;
+        self.out_dest.pipe_stderr = None;
+        self
+    }
 }
 
-impl Default for Stack {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use crate::{engine::EngineState, Span, Value};
+
+    use super::Stack;
+
+    const ZERO_SPAN: Span = Span { start: 0, end: 0 };
+    fn string_value(s: &str) -> Value {
+        Value::String {
+            val: s.to_string(),
+            internal_span: ZERO_SPAN,
+        }
+    }
+
+    #[test]
+    fn test_children_see_inner_values() {
+        let mut original = Stack::new();
+        original.add_var(0, string_value("hello"));
+
+        let cloned = Stack::with_parent(Arc::new(original));
+        assert_eq!(cloned.get_var(0, ZERO_SPAN), Ok(string_value("hello")));
+    }
+
+    #[test]
+    fn test_children_dont_see_deleted_values() {
+        let mut original = Stack::new();
+        original.add_var(0, string_value("hello"));
+
+        let mut cloned = Stack::with_parent(Arc::new(original));
+        cloned.remove_var(0);
+
+        assert_eq!(
+            cloned.get_var(0, ZERO_SPAN),
+            Err(crate::ShellError::VariableNotFoundAtRuntime { span: ZERO_SPAN })
+        );
+    }
+
+    #[test]
+    fn test_children_changes_override_parent() {
+        let mut original = Stack::new();
+        original.add_var(0, string_value("hello"));
+
+        let mut cloned = Stack::with_parent(Arc::new(original));
+        cloned.add_var(0, string_value("there"));
+        assert_eq!(cloned.get_var(0, ZERO_SPAN), Ok(string_value("there")));
+
+        cloned.remove_var(0);
+        // the underlying value shouldn't magically re-appear
+        assert_eq!(
+            cloned.get_var(0, ZERO_SPAN),
+            Err(crate::ShellError::VariableNotFoundAtRuntime { span: ZERO_SPAN })
+        );
+    }
+    #[test]
+    fn test_children_changes_persist_in_offspring() {
+        let mut original = Stack::new();
+        original.add_var(0, string_value("hello"));
+
+        let mut cloned = Stack::with_parent(Arc::new(original));
+        cloned.add_var(1, string_value("there"));
+
+        cloned.remove_var(0);
+        let cloned = Stack::with_parent(Arc::new(cloned));
+
+        assert_eq!(
+            cloned.get_var(0, ZERO_SPAN),
+            Err(crate::ShellError::VariableNotFoundAtRuntime { span: ZERO_SPAN })
+        );
+
+        assert_eq!(cloned.get_var(1, ZERO_SPAN), Ok(string_value("there")));
+    }
+
+    #[test]
+    fn test_merging_children_back_to_parent() {
+        let mut original = Stack::new();
+        let engine_state = EngineState::new();
+        original.add_var(0, string_value("hello"));
+
+        let original_arc = Arc::new(original);
+        let mut cloned = Stack::with_parent(original_arc.clone());
+        cloned.add_var(1, string_value("there"));
+
+        cloned.remove_var(0);
+
+        cloned.add_env_var("ADDED_IN_CHILD".to_string(), string_value("New Env Var"));
+
+        let original = Stack::with_changes_from_child(original_arc, cloned);
+
+        assert_eq!(
+            original.get_var(0, ZERO_SPAN),
+            Err(crate::ShellError::VariableNotFoundAtRuntime { span: ZERO_SPAN })
+        );
+
+        assert_eq!(original.get_var(1, ZERO_SPAN), Ok(string_value("there")));
+
+        assert_eq!(
+            original.get_env_var(&engine_state, "ADDED_IN_CHILD"),
+            Some(string_value("New Env Var")),
+        );
     }
 }

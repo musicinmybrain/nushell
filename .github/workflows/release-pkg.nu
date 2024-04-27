@@ -128,16 +128,16 @@ let executable = $'target/($target)/release/($bin)*($suffix)'
 print $'Current executable file: ($executable)'
 
 cd $src; mkdir $dist;
-rm -rf $'target/($target)/release/*.d' $'target/($target)/release/nu_pretty_hex*'
+rm -rf ...(glob $'target/($target)/release/*.d') ...(glob $'target/($target)/release/nu_pretty_hex*')
 print $'(char nl)All executable files:'; hr-line
 # We have to use `print` here to make sure the command output is displayed
-print (ls -f $executable); sleep 1sec
+print (ls -f ($executable | into glob)); sleep 1sec
 
 print $'(char nl)Copying release files...'; hr-line
 "To use Nu plugins, use the register command to tell Nu where to find the plugin. For example:
 
 > register ./nu_plugin_query" | save $'($dist)/README.txt' -f
-[LICENSE $executable] | each {|it| cp -rv $it $dist } | flatten
+[LICENSE ...(glob $executable)] | each {|it| cp -rv $it $dist } | flatten
 
 print $'(char nl)Check binary release version detail:'; hr-line
 let ver = if $os == 'windows-latest' {
@@ -160,9 +160,9 @@ if $os in ['macos-latest'] or $USE_UBUNTU {
     let archive = $'($dist)/($dest).tar.gz'
 
     mkdir $dest
-    $files | each {|it| mv $it $dest } | ignore
+    $files | each {|it| cp -v $it $dest }
 
-    print $'(char nl)(ansi g)Archive contents:(ansi reset)'; hr-line; ls $dest
+    print $'(char nl)(ansi g)Archive contents:(ansi reset)'; hr-line; ls $dest | print
 
     tar -czf $archive $dest
     print $'archive: ---> ($archive)'; ls $archive
@@ -181,10 +181,11 @@ if $os in ['macos-latest'] or $USE_UBUNTU {
     if (get-env _EXTRA_) == 'msi' {
 
         let wixRelease = $'($src)/target/wix/($releaseStem).msi'
-        print $'(char nl)Start creating Windows msi package...'
+        print $'(char nl)Start creating Windows msi package with the following contents...'
         cd $src; hr-line
         # Wix need the binaries be stored in target/release/
-        cp -r $'($dist)/*' target/release/
+        cp -r ($'($dist)/*' | into glob) target/release/
+        ls target/release/* | print
         cargo install cargo-wix --version 0.3.4
         cargo wix --no-build --nocapture --package nu --output $wixRelease
         # Workaround for https://github.com/softprops/action-gh-release/issues/280
@@ -194,9 +195,9 @@ if $os in ['macos-latest'] or $USE_UBUNTU {
 
     } else {
 
-        print $'(char nl)(ansi g)Archive contents:(ansi reset)'; hr-line; ls
+        print $'(char nl)(ansi g)Archive contents:(ansi reset)'; hr-line; ls | print
         let archive = $'($dist)/($releaseStem).zip'
-        7z a $archive *
+        7z a $archive ...(glob *)
         let pkg = (ls -f $archive | get name)
         if not ($pkg | is-empty) {
             # Workaround for https://github.com/softprops/action-gh-release/issues/280

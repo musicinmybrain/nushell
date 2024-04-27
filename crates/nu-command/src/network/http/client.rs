@@ -1,23 +1,24 @@
 use crate::formats::value_to_json_value;
-use base64::engine::general_purpose::PAD;
-use base64::engine::GeneralPurpose;
-use base64::{alphabet, Engine};
-use nu_protocol::ast::Call;
-use nu_protocol::engine::{EngineState, Stack};
-use nu_protocol::{
-    record, BufferedReader, IntoPipelineData, PipelineData, RawStream, ShellError, Span, Spanned,
-    Value,
+use base64::{
+    alphabet,
+    engine::{general_purpose::PAD, GeneralPurpose},
+    Engine,
+};
+use nu_engine::command_prelude::*;
+use nu_protocol::{BufferedReader, RawStream};
+use std::{
+    collections::HashMap,
+    io::BufReader,
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{self, RecvTimeoutError},
+        Arc,
+    },
+    time::Duration,
 };
 use ureq::{Error, ErrorKind, Request, Response};
-
-use std::collections::HashMap;
-use std::io::BufReader;
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
-use std::time::Duration;
 use url::Url;
 
 #[derive(PartialEq, Eq)]
@@ -122,9 +123,7 @@ pub fn response_to_buffer(
 
     PipelineData::ExternalStream {
         stdout: Some(RawStream::new(
-            Box::new(BufferedReader {
-                input: buffered_input,
-            }),
+            Box::new(BufferedReader::new(buffered_input)),
             engine_state.ctrlc.clone(),
             span,
             buffer_size,
@@ -221,7 +220,7 @@ pub fn send_request(
         Value::Record { val, .. } if body_type == BodyType::Form => {
             let mut data: Vec<(String, String)> = Vec::with_capacity(val.len());
 
-            for (col, val) in val {
+            for (col, val) in val.into_owned() {
                 data.push((col, val.coerce_into_string()?))
             }
 
@@ -283,7 +282,7 @@ fn send_cancellable_request(
             let ret = request_fn();
             let _ = tx.send(ret); // may fail if the user has cancelled the operation
         })
-        .expect("Failed to create thread");
+        .map_err(ShellError::from)?;
 
     // ...and poll the channel for responses
     loop {
@@ -335,7 +334,7 @@ pub fn request_add_custom_headers(
 
         match &headers {
             Value::Record { val, .. } => {
-                for (k, v) in val {
+                for (k, v) in &**val {
                     custom_headers.insert(k.to_string(), v.clone());
                 }
             }
@@ -345,7 +344,7 @@ pub fn request_add_custom_headers(
                     // single row([key1 key2]; [val1 val2])
                     match &table[0] {
                         Value::Record { val, .. } => {
-                            for (k, v) in val {
+                            for (k, v) in &**val {
                                 custom_headers.insert(k.to_string(), v.clone());
                             }
                         }
@@ -421,7 +420,6 @@ pub struct RequestFlags {
     pub full: bool,
 }
 
-#[allow(clippy::needless_return)]
 fn transform_response_using_content_type(
     engine_state: &EngineState,
     stack: &mut Stack,
@@ -464,9 +462,9 @@ fn transform_response_using_content_type(
 
     let output = response_to_buffer(resp, engine_state, span);
     if flags.raw {
-        return Ok(output);
+        Ok(output)
     } else if let Some(ext) = ext {
-        return match engine_state.find_decl(format!("from {ext}").as_bytes(), &[]) {
+        match engine_state.find_decl(format!("from {ext}").as_bytes(), &[]) {
             Some(converter_id) => engine_state.get_decl(converter_id).run(
                 engine_state,
                 stack,
@@ -474,10 +472,10 @@ fn transform_response_using_content_type(
                 output,
             ),
             None => Ok(output),
-        };
+        }
     } else {
-        return Ok(output);
-    };
+        Ok(output)
+    }
 }
 
 pub fn check_response_redirection(

@@ -1173,3 +1173,88 @@ fn test_cp_to_customized_home_directory() {
         ));
     })
 }
+
+#[test]
+fn cp_with_tilde() {
+    Playground::setup("cp_tilde", |dirs, sandbox| {
+        sandbox.within("~tilde").with_files(vec![
+            EmptyFile("f1.txt"),
+            EmptyFile("f2.txt"),
+            EmptyFile("f3.txt"),
+        ]);
+        sandbox.within("~tilde2");
+        // cp directory
+        let actual = nu!(
+            cwd: dirs.test(),
+            "let f = '~tilde'; cp -r $f '~tilde2'; ls '~tilde2/~tilde' | length"
+        );
+        assert_eq!(actual.out, "3");
+
+        // cp file
+        let actual = nu!(cwd: dirs.test(), "cp '~tilde/f1.txt' ./");
+        assert!(actual.err.is_empty());
+        assert!(files_exist_at(
+            vec![Path::new("f1.txt")],
+            dirs.test().join("~tilde")
+        ));
+        assert!(files_exist_at(vec![Path::new("f1.txt")], dirs.test()));
+
+        // pass variable
+        let actual = nu!(cwd: dirs.test(), "let f = '~tilde/f2.txt'; cp $f ./");
+        assert!(actual.err.is_empty());
+        assert!(files_exist_at(
+            vec![Path::new("f2.txt")],
+            dirs.test().join("~tilde")
+        ));
+        assert!(files_exist_at(vec![Path::new("f1.txt")], dirs.test()));
+    })
+}
+
+#[test]
+fn copy_file_with_update_flag() {
+    copy_file_with_update_flag_impl(false);
+    copy_file_with_update_flag_impl(true);
+}
+
+fn copy_file_with_update_flag_impl(progress: bool) {
+    Playground::setup("cp_test_36", |_dirs, sandbox| {
+        sandbox.with_files(vec![
+            EmptyFile("valid.txt"),
+            FileWithContent("newer_valid.txt", "body"),
+        ]);
+
+        let progress_flag = if progress { "-p" } else { "" };
+
+        let actual = nu!(
+            cwd: sandbox.cwd(),
+            "cp {} -u valid.txt newer_valid.txt; open newer_valid.txt",
+            progress_flag,
+        );
+        assert!(actual.out.contains("body"));
+
+        // create a file after assert to make sure that newest_valid.txt is newest
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        sandbox.with_files(vec![FileWithContent("newest_valid.txt", "newest_body")]);
+        let actual = nu!(cwd: sandbox.cwd(), "cp {} -u newest_valid.txt valid.txt; open valid.txt", progress_flag);
+        assert_eq!(actual.out, "newest_body");
+
+        // when destination doesn't exist
+        let actual = nu!(cwd: sandbox.cwd(), "cp {} -u newest_valid.txt des_missing.txt; open des_missing.txt", progress_flag);
+        assert_eq!(actual.out, "newest_body");
+    });
+}
+
+#[test]
+fn cp_with_cd() {
+    Playground::setup("cp_test_37", |_dirs, sandbox| {
+        sandbox
+            .mkdir("tmp_dir")
+            .with_files(vec![FileWithContent("tmp_dir/file.txt", "body")]);
+
+        let actual = nu!(
+            cwd: sandbox.cwd(),
+            r#"do { cd tmp_dir; let f = 'file.txt'; cp $f .. }; open file.txt"#,
+        );
+        assert!(actual.out.contains("body"));
+    });
+}
